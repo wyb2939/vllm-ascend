@@ -23,14 +23,16 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
-from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
+from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, is_circular_kv_cache_spec
 from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
@@ -256,6 +258,32 @@ class MooncakeBaseConnectorWorker:
             num_tensor_blocks // self.num_blocks,
         )
 
+    @staticmethod
+    def _get_transfer_block_shape(spec: KVCacheSpec, cache: torch.Tensor) -> tuple[int, ...]:
+        """Describe single-head NHD as byte-equivalent HND without changing the cache."""
+        shape = tuple(cache.shape[1:])
+        if (
+            not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
+            or isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec, AscendSFAIndexerCacheSpec))
+            or is_circular_kv_cache_spec(spec)
+        ):
+            return shape
+
+        heads = spec.num_kv_heads
+        if len(shape) != 3:
+            raise ValueError(f"MooncakeConnector expects a three-dimensional GQA KV block, got {shape}.")
+        if shape[0] == shape[1] == heads and heads > 1:
+            raise ValueError(f"MooncakeConnector cannot distinguish HND from NHD for {shape} with {heads} KV heads.")
+        if shape[0] == heads:
+            return shape  # HND
+        if shape[1] != heads:
+            raise ValueError(f"MooncakeConnector KV block shape {shape} does not match the spec's {heads} KV heads.")
+        if heads != 1:
+            raise ValueError("MooncakeConnector NHD requires exactly one KV head per TP rank.")
+        if not cache[0].is_contiguous():
+            raise ValueError("MooncakeConnector single-head NHD requires contiguous bytes within each KV block.")
+        return (1, shape[0], shape[2])  # [tokens, 1, dim] has the same bytes as [1, tokens, dim].
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
@@ -279,6 +307,7 @@ class MooncakeBaseConnectorWorker:
         block_lens_per_layer: list[list[int]] = []
         block_shapes_per_layer: list[list[tuple[int, ...]]] = []
         block_size_scales_per_layer: list[list[int]] = []
+        indexer_replication_sizes: list[int] = []
         configured_layer_names: set[str] = set()
 
         for tensor_config in self.kv_cache_config.kv_cache_tensors:
@@ -337,7 +366,7 @@ class MooncakeBaseConnectorWorker:
                     for cache in caches:
                         tensor_num_blocks = cache.shape[0]
                         element_size = cache.element_size()
-                        block_shape = tuple(cache.shape[1:])
+                        block_shape = self._get_transfer_block_shape(spec, cache)
                         base_addrs.append(cache.data_ptr())
                         block_strides.append(cache.stride(0) * element_size)
                         block_lens.append(math.prod(block_shape) * element_size)
@@ -359,6 +388,9 @@ class MooncakeBaseConnectorWorker:
                 block_lens_per_layer.append(block_lens)
                 block_shapes_per_layer.append(block_shapes)
                 block_size_scales_per_layer.append(block_size_scales)
+                indexer_replication_sizes.append(
+                    spec.sfa_dcp_replicated_indexer_size if isinstance(spec, AscendSFAIndexerCacheSpec) else 0
+                )
 
         unexpected_layers = kv_caches.keys() - configured_layer_names
         if unexpected_layers:
@@ -372,6 +404,7 @@ class MooncakeBaseConnectorWorker:
             engine_id=self.engine_id,
             te_rpc_port=self.te_rpc_port,
             block_size=self.block_size,
+            cp_kv_cache_interleave_size=self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
             num_blocks=self.num_blocks,
             layer_names=layer_names,
             layer_block_sizes=layer_block_sizes,
@@ -381,6 +414,7 @@ class MooncakeBaseConnectorWorker:
             block_lens=block_lens_per_layer,
             block_shapes=block_shapes_per_layer,
             block_size_scales=block_size_scales_per_layer,
+            indexer_replication_sizes=indexer_replication_sizes,
             local_ip=self.side_channel_host,
             handshake_port=self.handshake_port,
         )
