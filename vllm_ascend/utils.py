@@ -1431,12 +1431,31 @@ A5_C8_MXFP_KV_CACHE_BLOCK_SIZE = 512
 # present; it is not the switch.
 C8_MXFP_KV_CACHE_DTYPE = "mxfp8"
 
+# C8A16 shares the INT8 cache dtype with the static C8 scheme; the ModelSlim
+# recipe (``kv_cache_type: C8A16``) selects the dynamic per-token x per-head
+# variant.
+C8A16_KV_CACHE_DTYPE = "int8"
+
 
 def is_c8_mxfp_kv_quant(vllm_config: VllmConfig) -> bool:
     # Tolerate partially constructed configs (e.g. SimpleNamespace in tests):
     # a missing cache_config means the mxfp8 KV cache dtype is not enabled.
     cache_config = getattr(vllm_config, "cache_config", None)
     return cache_config is not None and cache_config.cache_dtype == C8_MXFP_KV_CACHE_DTYPE
+
+
+def is_c8a16_kv_quant(vllm_config: VllmConfig) -> bool:
+    """Whether C8A16 (INT8 KV + dynamic per-token x per-head scale) is active.
+
+    The switch is the ModelSlim recipe (``kv_cache_type: C8A16``) combined
+    with the INT8 cache dtype; the recipe alone does not enable it, matching
+    how C8-MXFP requires ``--kv-cache-dtype mxfp8``.
+    """
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if cache_config is None or cache_config.cache_dtype != C8A16_KV_CACHE_DTYPE:
+        return False
+    quant_config = getattr(vllm_config, "quant_config", None)
+    return bool(getattr(quant_config, "enable_c8a16_quant", False))
 
 
 def refresh_block_size(vllm_config):

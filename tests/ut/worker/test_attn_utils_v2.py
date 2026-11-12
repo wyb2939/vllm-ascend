@@ -26,6 +26,7 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.attention import dsa_attn_kv_plan, dsa_v1
 from vllm_ascend.attention import utils as attention_utils
 from vllm_ascend.attention.attention_c8_mxfp import mxfp_cache_spec, mxfp_paged_cache_views
+from vllm_ascend.attention.attention_c8a16 import c8a16_cache_spec
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -2887,6 +2888,35 @@ def _c8_mxfp_vllm_config(cache_dtype: str = "mxfp8") -> SimpleNamespace:
     )
 
 
+def _c8a16_vllm_config(cache_dtype: str = "int8", enable: bool = True) -> SimpleNamespace:
+    return SimpleNamespace(
+        kv_transfer_config=None,
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        attention_config=SimpleNamespace(indexer_kv_dtype="auto"),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="qwen3_next")),
+        quant_config=SimpleNamespace(enable_c8a16_quant=enable),
+    )
+
+
+def test_get_kv_cache_spec_rewrites_c8a16_spec(monkeypatch):
+    spec = _run_get_kv_cache_spec(monkeypatch, _c8a16_vllm_config(), _plain_full_attention_spec(128))["attn"]
+
+    assert spec.dtype == torch.int8
+    # One INT8 K byte + one INT8 V byte + two float32 scales per (token, head).
+    assert spec.state_content_bytes == 64 + 128 + 8
+    assert spec.page_size_bytes == 512 * 2 * spec.state_content_bytes
+
+
+def test_get_kv_cache_spec_keeps_plain_spec_without_c8a16_recipe(monkeypatch):
+    spec = _run_get_kv_cache_spec(
+        monkeypatch, _c8a16_vllm_config(enable=False), _plain_full_attention_spec()
+    )["attn"]
+
+    assert spec.dtype == torch.bfloat16
+    assert spec.state_content_bytes is None
+
+
 def _plain_full_attention_spec(head_size_v: int = 64) -> FullAttentionSpec:
     return FullAttentionSpec(
         block_size=512,
@@ -2969,6 +2999,48 @@ def test_reshape_kv_cache_v2_builds_c8_mxfp_views(monkeypatch, head_size_v):
     assert v_scale.shape == (num_blocks, 2, head_size_v // 16, 512 // 64, 16, 2)
     assert k_scale.dtype == v_scale.dtype == torch.uint8
     for view in (k, v, k_scale, v_scale):
+        assert view.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
+
+
+@pytest.mark.parametrize("head_size_v", [64, 128])
+def test_reshape_kv_cache_v2_builds_c8a16_views(monkeypatch, head_size_v):
+    spec = c8a16_cache_spec(_plain_full_attention_spec(head_size_v))
+    num_blocks = 3
+    layer_name = "attn"
+    raw = torch.full((num_blocks * spec.page_size_bytes,), 37, dtype=torch.int8)
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[_make_kv_cache_tensor(raw.numel(), [layer_name], spec.page_size_bytes)],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=[layer_name], kv_cache_spec=spec)],
+    )
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: _c8a16_vllm_config())
+    monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _cfg: False)
+    monkeypatch.setattr(attn_utils, "enable_sfa", lambda _cfg: False)
+
+    reshaped = attn_utils._reshape_kv_cache_v2(
+        attn_groups=[
+            AttentionGroup(
+                backend=AscendAttentionBackend,
+                layer_names=[layer_name],
+                kv_cache_spec=spec,
+                kv_cache_group_id=0,
+            )
+        ],
+        kv_cache_raw_tensors={layer_name: raw},
+        cache_dtype="int8",
+        kernel_block_sizes=[512],
+        shared_kv_cache_layers={},
+        kv_cache_config=kv_cache_config,
+    )
+
+    k, k_scale, v, v_scale = reshaped[layer_name]
+    assert k.shape == (num_blocks, 512, 2, 64)
+    assert v.shape == (num_blocks, 512, 2, head_size_v)
+    assert k.dtype == v.dtype == torch.int8
+    assert k_scale.shape == (num_blocks, 2, 512)
+    assert v_scale.shape == (num_blocks, 2, 512)
+    assert k_scale.dtype == v_scale.dtype == torch.float32
+    for view in (k, k_scale, v, v_scale):
         assert view.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
 
 

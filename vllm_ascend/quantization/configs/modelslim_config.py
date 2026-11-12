@@ -64,6 +64,9 @@ _MOE_WEIGHT_LOADER_NAME_MAP = {
 # the backend has no per-layer switch, and the linear-attention layers never
 # reach it.
 _MXFP_C8_KV_CACHE_TYPE = "K_DYNAMIC_V_STATIC_MXFP8_PER_CHANNEL"
+# C8A16: INT8 KV cache with a runtime per-(token, head) scale. The recipe is
+# model-wide and carries no KV scales in the checkpoint.
+_C8A16_KV_CACHE_TYPE = "C8A16"
 _MXFP_C8_LAYER_QUANT_TYPE_SUFFIX = ".self_attn.quant_type"
 _MXFP_C8_LAYER_QUANT_TYPES = ("QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL",)
 # FAKQuant parameters that MXFP8 has no home for: K and Q are quantized
@@ -492,6 +495,7 @@ class AscendModelSlimConfig(QuantizationConfig):
     indexer_quant_layers: list[int]
     enable_c8_quant: bool
     c8_quant_layers: list[int]
+    enable_c8a16_quant: bool
 
     def __init__(self, quant_config: dict[str, Any] | None = None):
         super().__init__()
@@ -879,6 +883,11 @@ class AscendModelSlimConfig(QuantizationConfig):
 
                 scheme = AscendC8KVCacheAttentionMethod(self.quant_description, prefix)
                 logger.debug("Select AscendKVCacheMethod(C8) for %s (layer=%s)", prefix, "AttentionLayerBase[C8]")
+            elif self.is_c8a16_quant_layer(prefix) and self._is_full_attention_layer(layer):
+                from ..methods.kv_cache.c8a16 import AscendC8A16KVCacheAttentionMethod
+
+                scheme = AscendC8A16KVCacheAttentionMethod(self.quant_description, prefix)
+                logger.debug("Select AscendKVCacheMethod(C8A16) for %s (layer=%s)", prefix, "AttentionLayerBase[C8A16]")
             elif self.enable_mxfp_c8_quant and self._is_full_attention_layer(layer):
                 if self._has_mxfp_c8_recipe is False:
                     logger.warning_once(
@@ -953,6 +962,16 @@ class AscendModelSlimConfig(QuantizationConfig):
             if layer_id_str.isdigit() and int(layer_id_str) in self.c8_quant_layers:
                 return True
         return False
+
+    def is_c8a16_quant_layer(self, prefix):
+        """C8A16 applies to every full-attention layer that owns a KV cache.
+
+        Unlike C8, the recipe carries no per-layer scale tensors to key off,
+        so the model-wide switch is the whole decision. Layers without a KV
+        cache (linear attention, encoder attention) never reach this path
+        because the caller also requires a full-attention ``Attention``.
+        """
+        return self.enable_c8a16_quant
 
     @staticmethod
     def _is_full_attention_layer(layer: torch.nn.Module) -> bool:
@@ -1210,6 +1229,10 @@ class AscendModelSlimConfig(QuantizationConfig):
         kv_quant_type = self.quant_description.get("kv_cache_type", "")
         self.enable_c8_quant = kv_quant_type == "C8"
         self.c8_quant_layers = []
+        # C8A16 (dynamic per-token x per-head INT8 KV) is declared model-wide
+        # and carries no checkpoint scales: every full-attention layer that
+        # owns a KV cache uses it.
+        self.enable_c8a16_quant = kv_quant_type == _C8A16_KV_CACHE_TYPE
         if self.enable_fa_quant or self.enable_indexer_quant or self.enable_c8_quant:
             for key in self.quant_description:
                 _id = "".join(re.findall(r"\.(\d+)\.", key))

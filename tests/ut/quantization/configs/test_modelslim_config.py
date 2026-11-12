@@ -387,6 +387,20 @@ class TestAscendModelSlimConfig(TestBase):
 
             self.assertIsInstance(args[0], AscendC8KVCacheAttentionMethod)
 
+    def test_c8a16_recipe_enables_quant_for_full_attention_layers(self):
+        # C8A16 is model-wide and carries no per-layer scale tensors, so the
+        # recipe alone decides; the layer type gate keeps non-Attention
+        # AttentionLayerBase subclasses (GDN/Mamba) off the path.
+        config = AscendModelSlimConfig({"kv_cache_type": "C8A16"})
+        self.assertTrue(config.enable_c8a16_quant)
+        self.assertFalse(config.enable_c8_quant)
+        self.assertTrue(config.is_c8a16_quant_layer("model.layers.0.self_attn.attn"))
+
+    def test_c8a16_recipe_absent_leaves_quant_off(self):
+        config = AscendModelSlimConfig({"kv_cache_type": "C8"})
+        self.assertFalse(config.enable_c8a16_quant)
+        self.assertFalse(config.is_c8a16_quant_layer("model.layers.0.self_attn.attn"))
+
     def test_missing_k_eq_v_v_proj_shard_uses_present_shards(self):
         prefix = "model.layers.5.self_attn.qkv_proj"
         fused_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
