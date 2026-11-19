@@ -1,0 +1,6 @@
+长上下文新算子输出乱码（!!!!!!!），短/中/1K 输入均正常。之前失败的是更长输入（~2K+）。阈值正好是 1664（scheduler block size），超过一个 scheduler block 就坏。阈值精确等于 1664（scheduler block size），高度怀疑 block_table 仍是 scheduler 粒度而非 kernel 粒度。
+其他agent分析的原因如下：
+可能原因1：state=ChunkedPrefill、asq=[893]、seq_lens=[2557]，即**续块（continuing chunk）**走 _dequant_paged_kv_to_dense_pth。该函数里 scale   索引写错了：  token_heads = self.k_scale_cache[row_requests, :, row_slots]  # 用 request 索引当 block id
+  k_scale_cache 形状是 (num_blocks, heads, block_size)，第一维必须是 block id、第三维必须是 块内偏移，但代码传的是 request 序号和全局位置。短 promp   走 PrefillNoCache（float KV）不经过此路径，所以只有 >1664 token 才出错——与实测阈值完全吻合
+
+可能原因2：float_key/float_value 在 forward 里总是非 None（本 chunk 的 K/V），所以续块（seq_len 2557 > qlen   893）错误地走了"全新区块"分支，只用自己的 893 个 token 做 attention，忽略了已缓存的 1664 历史
