@@ -1,0 +1,32 @@
+现象：新算子实例（12,13 卡）在 graph capture 阶段启动失败，报 561002：
+  Non-contiguous cache is supported only by the arch22 regular FAInfer or D512 MLA PA routes.
+  [FUNC:TilingFusedInferAttentionScore]
+
+  根因：attention_c8_pth.py 把 K/V 和 scale 放在同一块 raw allocation 里，用 as_strided 切出四个视图（K|V|K_scale|V_scale）。因此 K/V 的 stride[0]    整页 pitch（含 V+scale 字节），不是连续张量。
+
+  - 直接调 npu_fused_infer_attention_score（eager，_forward_pth_attention）→ 能通过（我已复现 OK）
+  - 但 capture 路径 full_graph_fia 会先调 _npu_fused_infer_attention_score_get_max_workspace 查询 workspace → 该 tiling 路径拒绝非连续 cache，直接   561002
+
+  我做了最小复现验证：
+  非连续 key/value → get_max_workspace FAIL (561002)
+  contiguous 同形状   → get_max_workspace OK
+
+  为什么阶段 0 的 test_fia.py 全过：它用的是独立连续张量 torch.zeros(num_blocks, BLOCK_SIZE,   Nkv*D)，没有合并分配，所以不触发这个问题。这是集成路径与算子级测试之间的布局差异。
+
+  建议的修复
+
+  在 full_graph_fia（attention_v1.py:2501 附近）里，get_max_workspace 只用形状/类型决定 workspace   大小，与数据无关。因此用同形状同类型的连续张量去查询即可，实际 FIA 调用仍用非连续视图：
+
+  lambda: torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+      query=query,
+      key=key.contiguous(),      # 仅用于 workspace 查询
+      value=value.contiguous(),
+      ...
+  )
+
+  需要你确认：
+
+  1. 是否允许我按上述方式修改容器内代码（vllm_ascend/attention/attention_v1.py 的 full_graph_fia）来修复这个缺陷？
+  2. 还是你希望先只做记录、把问题回报给算子开发方，由他们改？
+
+  另外提醒：该模型是 hybrid（48 层 linear_attention + 16 层 full_attention），文档排障表也提到 hybrid 模型可能不适用本方案；但当前报错与 hybrid   无关，是纯粹的 cache 连续性缺陷。
