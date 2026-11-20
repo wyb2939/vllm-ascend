@@ -1,0 +1,46 @@
+  长上下文非确定性 !!!! 的根因不是算子精度，而是 hybrid KV cache 共享内存布局冲突。
+
+  证据链
+
+  ┌─────────────────────────────────────────────┬─────────────────────────┐
+  │                    实验                     │          结果           │
+  ├─────────────────────────────────────────────┼─────────────────────────┤
+  │ C8_PTH，单 chunk（8192，5004 token 一次过） │ 正常                    │
+  ├─────────────────────────────────────────────┼─────────────────────────┤
+  │ C8_PTH，2 chunk（4096+908）                 │ 正常                    │
+  ├─────────────────────────────────────────────┼─────────────────────────┤
+  │ C8_PTH，3 chunk（2048+2048+908）            │ 必现 !!!!!!             │
+  ├─────────────────────────────────────────────┼─────────────────────────┤
+  │ BF16 KV，3 chunk 同配置                     │ 正常                    │
+  ├─────────────────────────────────────────────┼─────────────────────────┤
+  │ --no-async-scheduling                       │ 仍失败（排除 WAR 竞争） │
+  └─────────────────────────────────────────────┴─────────────────────────┘
+
+  探针精确定位：
+  1. 第 3 chunk 的 layer 0（linear_attention/GDN）输入干净、输出全 NaN
+  2. GDN 的 cache_indices=[3] 指向的 conv/ssm state 槽位已被写成 NaN（第 2 chunk 时还是干净的 0）
+  3. [TENSORS]：4 个 KV cache tensor 全部 offset=0
+  4. [HB]：full-attn 组（layers 3,7,11…）与 Mamba 组（layers 0,4,8…）的 start 完全相同，映射到同一段内存
+
+  根因
+
+  _allocate_kv_cache 的 hybrid 分支给所有 cache group 分配一份 hybrid_backing，各组 tensor 的 offset 都是 0（上游设计：overlay   别名是安全的，前提是同一 block id 在所有组里落在同一物理偏移，即 block_size/page 布局必须一致）。
+
+  - BF16：full-attn 和 Mamba 的 block_size 都是 896 → 满足前提 → 正常
+  - C8_PTH：c8_pth_cache_spec 通过 state_content_bytes 把 full-attn page 从 1835008 缩到 1730560，但 _align_hybrid_attention_page_sizes 只对齐   FullAttentionSpec/SlidingWindowSpec，不处理 MambaSpec。结果：
+    - full-attn: blk=1664, page=1730560
+    - Mamba: blk=8192, page=1730560 (padded from real=1603584)
+    - block_size 不同 → 同一 block id 落到不同 token 偏移 → full-attn 写 KV 时踩掉 Mamba 的 conv/ssm state → 下一个 chunk 的 GDN 读到 NaN
+
+  这也解释了为什么"单 chunk 正常"：单 chunk 时 Mamba 状态还没被跨 chunk 复用，踩踏不显现。
+
+  代码已恢复
+
+  远程仓库已恢复到"补丁已应用、无任何探针"的干净状态（attention_v1.py / attn_utils.py 用 per-file patch 精确重放，gdn.py / patch_qwen3_5.py 用 git   show HEAD: 还原，语法校验通过，c8probe 引用为 0）。
+
+  修复方向（待你确认）
+
+  需要在 hybrid 布局下保证 Mamba 与 full-attn 的 block_size 一致，两种方案：
+
+  1. 对齐 Mamba 的 block_size：在 _align_hybrid_attention_page_sizes 或 C8_PTH spec 处理里，把 MambaSpec 的 block_size 也拉到与 full-attn   相同的值（并相应调整 page），使同一 block id 的物理偏移一致。
+  2. 给每组独立 backing：让 full-attn 组和 Mamba 组各用一份 backing（内存翻倍，不可接受）。
