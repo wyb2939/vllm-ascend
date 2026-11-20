@@ -1,0 +1,59 @@
+新补丁已应用并测试完毕
+
+  补丁内容
+
+  /home/w00544044/c8_pth_fia_mode5.patch（99123 B，md5 4bc12eff）相比上一版只改了 attention_c8_pth.py 和测试文件：
+
+  - c8_pth_cache_views_for_spec 的 kernel block 数改为从 payload 预算推导（scheduler_blocks * (block_size // kernel_block_size)），不再用 padded   page 推导
+  - 新增单测 test_views_are_independent_of_hybrid_padded_pages
+
+  这个改动对本配置是数学等价的（我实测 num_kernel_blocks 仍是 19578，payload 恰好填满 2606223360 B）。
+
+  测试结果
+
+  ┌───────────────────────────────┬────────┐
+  │             场景              │  结果  │
+  ├───────────────────────────────┼────────┤
+  │ 单 chunk（5004 token 一次过） │ 正常   │
+  ├───────────────────────────────┼────────┤
+  │ 2 chunk（4096+908）           │ 正常   │
+  ├───────────────────────────────┼────────┤
+  │ 3 chunk（2048+2048+908）      │ 仍失败 │
+  ├───────────────────────────────┼────────┤
+  │ BF16 基线 3 chunk             │ 正常   │
+  └───────────────────────────────┴────────┘
+
+  但出现了一个重要变化：从"必现失败"变成"间歇性失败"（6 次里 2 次正确、4 次 !!!!），说明补丁缩小了踩踏窗口但没消除。
+
+  根因（已用算术证明）
+
+  kv cache group sizes 日志：BF16 是 (896, 896, 896, 896)，C8 是 (1664, 8192, 8192, 8192)。
+
+  hybrid 池里所有 group 共用一份 hybrid_backing 且 offset 都是 0，靠 block_id × page 定位。但 C8 的 section-major 布局让一个 kernel block 的 K   段只占 65536 字节（128×2×256），而 Mamba 的 state 按 page_size_padded = 1730560 定位。两个坐标系不同，必然穿插：
+
+  ┌─────────────────┬────────────┬───────────────────────────┐
+  │ full-attn block │ K 字节偏移 │     落进 Mamba state      │
+  ├─────────────────┼────────────┼───────────────────────────┤
+  │ 13              │ 851,968    │ state 0                   │
+  ├─────────────────┼────────────┼───────────────────────────┤
+  │ 52              │ 3,407,872  │ state 1                   │
+  ├─────────────────┼────────────┼───────────────────────────┤
+  │ 79              │ 5,177,344  │ state 2                   │
+  ├─────────────────┼────────────┼───────────────────────────┤
+  │ 103             │ 6,750,208  │ state 3 ← 本请求用的 slot │
+  └─────────────────┴────────────┴───────────────────────────┘
+
+  探针实测印证：chunk 2 时 slot=3 ssm_abs=27.79（干净），chunk 3 时同 slot ssm_nan=572 ssm_abs=nan。中间只发生了 full-attn 层的 KV 写入。
+
+  BF16 下 full-attn 的 block 是 b × 1835008，与 Mamba 的 k × 1835008 同坐标系（block_size 都是 896），所以不错位。
+
+  代码状态
+
+  远程仓库已恢复到"新补丁已应用、无任何探针"的干净状态（c8probe 引用为 0，语法校验通过，Hybrid-page independence 与   AscendC8PerTokenHeadAttentionBackendImpl 均在位）。
+
+  修复建议
+
+  补丁没有触及真正的坐标系冲突。要修需要二者之一：
+
+  1. 让 hybrid 池里 Mamba 与 full-attn 的 block_size 一致——最干净。在 spec 阶段把 MambaSpec 的 block_size 也对齐到 full-attn 的值（或反过来），使   block_id × 物理跨度 在两个 group 里指向同一字节区间。
+  2. 给 full-attn 与 Mamba 分配独立 backing——内存翻倍，不可接受。
