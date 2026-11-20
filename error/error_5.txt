@@ -1,0 +1,20 @@
+最新补丁的两项预期已全部达成
+
+  serve_align.log 确认：
+  - C8 per-token-head hybrid pool: aligning mamba block size 8192 -> 1664（每个 worker 一次）✓
+  - kv cache group sizes (1664, 1664, 1664, 1664) ✓
+
+  但引入新崩溃，根因已定位并修复
+
+  RuntimeError: Block table write for request 255, group 1 exceeds row capacity (2 > 1)
+
+  - 崩溃点：/vllm-workspace/vllm/vllm/v1/worker/gpu/block_table.py:140（append_block_ids），end > row_capacity。
+  - 根因：block table 行宽来自 MambaSpec.max_num_blocks_per_req。非 align 模式（本实例 enable_prefix_caching=False）返回   cdiv(max_memory_usage_bytes, page_size_bytes) = 1 + num_speculative_blocks = 1。这个值只有在 block_size == max_model_len 时才是"整条序列"宽度。把  mamba block 对齐到 1664 后，5004 token 的请求跨 4 个 scheduler block，但行仍只有 1 列 → 第 2 个 block 写入即越界。
+
+  修复（已写入远程 vllm_ascend/patch/worker/patch_model_runner.py，语法校验通过）：
+  if isinstance(layer_spec, MambaSpec) and layer_spec.mamba_cache_mode != "align":
+      max_num_blocks = max(
+          max_num_blocks,
+          cdiv(block_table_max_model_len, spec.block_size) + layer_spec.num_speculative_blocks,
+      )
+  即当 mamba 非 align 且 block 被缩小时，把行宽提升到覆盖整条序列（cdiv(max_len, block_size)）。
