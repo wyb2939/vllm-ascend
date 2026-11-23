@@ -1,0 +1,18 @@
+  根因是三层叠加的共享内存布局问题：
+
+    block_size 不一致：C8 让 attention 的 scheduler block 变成 1664，而 Mamba 仍是 8192。hybrid 池里所有 group 的 kv_cache_tensor.offset=0，靠       block id × page 定位，block_size 不同 → 同一 block id 在两组里落在不同 token 范围 → 互相踩踏。
+        - 修复：get_kv_cache_spec 里把 Mamba block_size 对齐到 attention 的 1664。
+      block table 行宽不足：对齐后启动即崩 Block table write ... exceeds row capacity (2 > 1)。因为非 align 模式 MambaSpec.max_num_blocks_per_req       返回 cdiv(max_memory_usage_bytes, page_size_bytes) = 1，隐含假设 block_size == max_model_len。
+        - 修复：patch_model_runner.initialize_kv_cache 里把 mamba 行宽提升到 cdiv(max_len, block_size) + num_speculative_blocks（本配置 5 行）。
+      对齐 block_size 仍不够（关键发现）：崩溃消失但乱码仍在（2/8 正确，比例不变）。因为 C8 是 section-major 布局，K 段每个 scheduler block 只跨   1664×2×256 = 851968 B，而 page 是 1730560 B。于是 C8 blk b 的 K 在 b×851968 与 mamba blk b 的 state 在 b×1730560 仍是两套坐标系——C8 的 blk   1、blk 2 的 K 都落进 mamba page 0。
+    - 修复：让 C8 full-attn 层退出 hybrid_backing 别名，每层独立分配 backing；Mamba 组继续共享。
+      独立 backing 引发 OOM 与 num_blocks 计算错误：
+        - 独立后 KV 内存翻倍（38.7 → 77 GiB），需 num_blocks 减半。
+        - 最新补丁在 kv_cache_config_builder.py 里自动收缩 num_blocks，但 _group_layer_specs 对普通 spec 只返回 1 个 page、忽略了   group.layer_names 的层数 → 每 block 成本少算 4 倍 → num_blocks=6009 → 分配 155 GiB OOM。
+        - 修复：按 [spec] * len(group.layer_names) 展开，成本 = attention 16 层 × page + mamba 一组 × page → num_blocks=751，正常启动。
+
+      验证结果
+
+      - kv cache group sizes (1664, 1664, 1664, 1664) ✓
+      - [HB2] 探针确认 16 个 attention 层 data_ptr 各不相同、不与 mamba 重叠 ✓
+  - 3-chunk 复测 18/18 全部正确（\n\n thinking\nHere's a thinking process:），无崩溃 ✓
