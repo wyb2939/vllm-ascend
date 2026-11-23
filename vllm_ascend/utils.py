@@ -1464,12 +1464,36 @@ A5_C8_MXFP_KV_CACHE_BLOCK_SIZE = 512
 # present; it is not the switch.
 C8_MXFP_KV_CACHE_DTYPE = "mxfp8"
 
+# ModelSlim recipe name for the per-(token, head) INT8 KV cache. K/V scales are
+# computed dynamically at cache-write time (no checkpoint scale tensors), and
+# ``npu_fused_infer_attention_score`` dequantizes the paged INT8 KV in-kernel
+# (antiquant mode 5, C8A16 pseudo-quantization). Enabled by serving the recipe
+# checkpoint with ``--kv-cache-dtype int8`` on A2/A3.
+C8_PTH_KV_CACHE_TYPE = "C8_PER_TOKEN_HEAD"
+
 
 def is_c8_mxfp_kv_quant(vllm_config: VllmConfig) -> bool:
     # Tolerate partially constructed configs (e.g. SimpleNamespace in tests):
     # a missing cache_config means the mxfp8 KV cache dtype is not enabled.
     cache_config = getattr(vllm_config, "cache_config", None)
     return cache_config is not None and cache_config.cache_dtype == C8_MXFP_KV_CACHE_DTYPE
+
+
+def is_c8_pth_kv_quant(vllm_config: VllmConfig) -> bool:
+    """Whether the FIA antiquant-mode-5 (per-(token, head)) KV cache is active.
+
+    All three conditions must hold: the checkpoint carries the C8_PER_TOKEN_HEAD
+    recipe, the KV cache is served as INT8 (``--kv-cache-dtype int8``), and the
+    hardware supports the operator's antiquant mode 5 (A2/A3 only). Tolerates
+    partially constructed configs the same way ``is_c8_mxfp_kv_quant`` does.
+    """
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if cache_config is None or cache_config.cache_dtype != "int8":
+        return False
+    quant_config = getattr(vllm_config, "quant_config", None)
+    if quant_config is None or not getattr(quant_config, "_has_c8_pth_recipe", False):
+        return False
+    return get_current_hardware_profile().supports(HardwareCapability.FIA_ANTIQ_PER_TOKEN_HEAD)
 
 
 def refresh_block_size(vllm_config):

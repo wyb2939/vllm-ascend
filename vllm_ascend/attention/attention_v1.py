@@ -615,15 +615,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.enable_c8_quant = self.vllm_config.quant_config is not None and getattr(
             self.vllm_config.quant_config, "enable_c8_quant", False
         )
+        from vllm_ascend.utils import is_c8_pth_kv_quant
+
+        # The per-(token, head) INT8 KV cache (FIA antiquant mode 5) reuses the
+        # base constructor via class surgery; it must pass the INT8 gate below
+        # and carry its own flag so the static per-channel C8 paths never fire.
+        self.enable_c8_pth_quant = is_c8_pth_kv_quant(self.vllm_config)
         # Note: Some embedding model weights are in float32 format.
         if self.kv_cache_dtype in [torch.float16, torch.bfloat16, torch.float32]:
             self.enable_c8_quant = False
+            self.enable_c8_pth_quant = False
         else:
             from vllm_ascend.utils import is_c8_mxfp_kv_quant
 
             # MXFP8 is switched on by --kv-cache-dtype itself, so it must
             # not be gated by the recipe-derived C8 flag.
-            if not self.enable_c8_quant and not is_c8_mxfp_kv_quant(self.vllm_config):
+            if not self.enable_c8_quant and not self.enable_c8_pth_quant and not is_c8_mxfp_kv_quant(self.vllm_config):
                 raise ValueError(
                     "The current GQA‑related models adopt static quantization. "
                     "KV quantization is configured via `--kv‑cache‑dtype` upon service startup, "
@@ -1874,3 +1881,741 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
 
             notify_kv_cache_written()
         return query, key, value, output
+
+
+def _per_request_query_lens(attn_metadata) -> list[int]:
+    """Per-request query lengths from the cumulative ``actual_seq_lengths_q``.
+
+    Trailing entries beyond the batch may carry padding; callers compare
+    against ``seq_lens_list`` element-wise, so trim to the batch size.
+    """
+    actual_q = attn_metadata.actual_seq_lengths_q
+    batch = len(attn_metadata.seq_lens_list)
+    starts = [0, *actual_q[: batch - 1]]
+    return [end - start for start, end in zip(starts, actual_q[:batch])]
+
+
+class AscendC8PerTokenHeadAttentionBackendImpl(AscendC8AttentionBackendImpl):
+    """Attention backend for the per-(token, head) INT8 KV cache (FIA antiquant mode 5).
+
+    This subclass implements the dynamic per-(token, head) INT8 KV cache
+    (ModelSlim recipe ``kv_cache_type: "C8_PER_TOKEN_HEAD"`` served with
+    ``--kv-cache-dtype int8``). It is activated via class surgery in
+    AscendC8PerTokenHeadKVCacheAttentionMethod.create_weights
+    (vllm_ascend/quantization/methods/kv_cache/kv_c8_pth.py).
+
+    Flow: prefill calls ``npu_dynamic_quant`` (int8) on the BF16/FP16 K/V,
+    scatters the INT8 pages and the fp32 per-(token, head) scales into the
+    layer's ``(k, v, k_scale, v_scale)`` cache tuple, and every phase
+    (decode, prefill, chunked prefill) then runs
+    ``npu_fused_infer_attention_score`` with ``antiquant mode 5``: the kernel
+    dequantizes the paged INT8 KV in-kernel (C8A16 pseudo-quantization) and
+    computes float attention against the BF16/FP16 query. When the antiquant
+    parameters and the separated KV dequant scales were both supplied the
+    separated ones would win, so this integration passes ONLY the antiquant
+    scales and never sets ``dequant_scale_key``/``dequant_scale_value``.
+
+    Hardware scope: A2/A3 only (``HardwareCapability.FIA_ANTIQ_PER_TOKEN_HEAD``).
+    A5 runs its own QFA stack and is refused loudly at construction (the quant
+    method's hardware gate) and, as defense in depth, at forward time.
+    """
+
+    # Bound from the layer's cache tuple on the first forward (the class-swap
+    # constructor path never runs a subclass __init__, so class-level defaults
+    # are required; see AscendC8MXFPAttentionBackendImpl for the same pattern).
+    k_scale_cache: torch.Tensor | None = None
+    v_scale_cache: torch.Tensor | None = None
+
+    @staticmethod
+    def _require_fia_antiq_support() -> None:
+        if not get_current_hardware_profile().supports(HardwareCapability.FIA_ANTIQ_PER_TOKEN_HEAD):
+            raise ValueError(
+                "[vllm-ascend/C8_PER_TOKEN_HEAD] The per-(token, head) INT8 KV cache "
+                "(FIA antiquant mode 5) is only supported on A2/A3 devices."
+            )
+
+    def _bind_pth_caches(self, kv_cache) -> None:
+        """Bind the INT8 pages and the paged scale caches from the layer tuple."""
+        if self.key_cache is None and kv_cache is not None and len(kv_cache) >= 2:
+            self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+        if self.k_scale_cache is None and kv_cache is not None and len(kv_cache) >= 4:
+            self.k_scale_cache, self.v_scale_cache = kv_cache[2], kv_cache[3]
+
+    def _pth_kv_cache_view(self) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """FIA's paged INT8 (C8A16) cache layout is (blocks, block_size, H*D)
+        regardless of the query layout (test_fia.py contract), so the view is
+        built explicitly in ND order instead of honoring VLLM_KV_CACHE_LAYOUT.
+        The section-major raw allocation makes each of K/V one contiguous run,
+        so this view is contiguous — required by the FIA tiling path behind
+        ``_npu_fused_infer_attention_score_get_max_workspace`` (a
+        per-page-interleaved stride[0] = page-pitch layout is rejected with
+        561002 during graph capture).
+        """
+        num_blocks, block_size, _, _ = self.key_cache.shape  # type: ignore[attr-defined]
+        key = self.key_cache.view(num_blocks, block_size, -1)  # type: ignore[attr-defined]
+        value = self.value_cache.view(num_blocks, block_size, -1)  # type: ignore[attr-defined]
+        return key, value, block_size
+
+    def _dequant_paged_kv_to_dense_pth(
+        self,
+        block_table: torch.Tensor,
+        seq_lens: list[int],
+        target_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather paged INT8 KV (ND layout) and dequantize to dense float.
+
+        Only used by TND prefill calls for continuing chunks: TND does not
+        support KV antiquant, so the per-(token, head) fp32 scales travel as a
+        dense gather + multiply instead of operator in-kernel antiquant params
+        (which are BNSD-only). Returns ``(T, H, D)`` dense K/V.
+        """
+        batch_size = block_table.shape[0]
+        num_blocks_per_seq = block_table.shape[1]
+        _, block_size, _, head_size_v = self.value_cache.shape  # type: ignore[attr-defined]
+        if head_size_v != self.head_size:
+            raise NotImplementedError(
+                "C8 per-token-head KV cache requires matching K/V head dims; "
+                f"got head_size={self.head_size}, V head dim={head_size_v}."
+            )
+        max_tokens_padded = num_blocks_per_seq * block_size
+
+        flat_ids = block_table.reshape(-1)
+        # ND gather: (batch*blocks, block, H, D) -> (batch, max_tokens, H, D).
+        # The V head dim comes from the bound cache's own shape (the base
+        # impl has no head_size_v attribute).
+        gathered_k = self.key_cache[flat_ids].view(batch_size, max_tokens_padded, self.num_kv_heads, self.head_size)
+        gathered_v = self.value_cache[flat_ids].view(batch_size, max_tokens_padded, self.num_kv_heads, head_size_v)
+
+        seq_lens_t = torch.tensor(seq_lens, dtype=torch.long, device=flat_ids.device)
+        positions = torch.arange(max_tokens_padded, dtype=torch.long, device=flat_ids.device)
+        valid_mask = positions.unsqueeze(0) < seq_lens_t.unsqueeze(1)
+        total_valid = int(valid_mask.sum().item())
+
+        dense_k = gathered_k.view(-1, self.num_kv_heads, self.head_size)[valid_mask.reshape(-1)][:total_valid]
+        dense_v = gathered_v.view(-1, self.num_kv_heads, head_size_v)[valid_mask.reshape(-1)][:total_valid]
+
+        # Dense K rows follow request-major order: token t of request b sits
+        # at row b * max_tokens_padded + t, and its scale lives in the paged
+        # cache at [block_table[b, t // block_size], :, t % block_size] —
+        # the page walk must go through the block table, NOT through the
+        # request index (dim 0 is the cache block id) or the raw global
+        # position (dim 2 is the in-block offset).
+        row_requests = (
+            torch.arange(batch_size, device=flat_ids.device).unsqueeze(1).expand(-1, max_tokens_padded)[valid_mask]
+        )
+        row_slots = positions.unsqueeze(0).expand(batch_size, -1)[valid_mask]
+        row_block_ids = block_table[row_requests, row_slots // block_size]
+        row_offsets = row_slots % block_size
+        token_heads = self.k_scale_cache[row_block_ids, :, row_offsets].to(target_dtype).unsqueeze(-1)  # (rows, H, 1)
+        dense_k = dense_k.to(target_dtype) * token_heads
+        value_heads = self.v_scale_cache[row_block_ids, :, row_offsets].to(target_dtype).unsqueeze(-1)
+        dense_v = dense_v.to(target_dtype) * value_heads
+        return dense_k, dense_v
+
+    def _quantize_kv_per_token_head(
+        self, key: torch.Tensor, value: torch.Tensor, num_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dynamically quantize K/V to INT8 with per-(token, head) fp32 scales.
+
+        ``npu_dynamic_quant`` in int8 mode emits one symmetric scale per
+        (token, kv-head): the exact granularity FIA antiquant mode 5 consumes.
+        """
+        k_int8, k_scale = DeviceOperator.npu_dynamic_quant(key[:num_tokens], act_quant_type=torch.int8)
+        v_int8, v_scale = DeviceOperator.npu_dynamic_quant(value[:num_tokens], act_quant_type=torch.int8)
+        return k_int8, v_int8, k_scale, v_scale
+
+    def _scatter_pth_scale_caches(self, k_scale: torch.Tensor, v_scale: torch.Tensor, attn_metadata) -> None:
+        """Write this step's scales into the paged fp32 scale caches.
+
+        The scale caches are ``(num_blocks, num_kv_heads, block_size, 1)``
+        head-major views over the raw allocation; a token at slot ``s`` lands
+        at ``[s // block_size, :, s % block_size]`` (3-D head-major fp32 cache). Padded rows are
+        clamped to slot 0 (the null block) exactly like the C8-MXFP scale
+        scatter, keeping shapes static for graph capture.
+        """
+        if self.k_scale_cache is None or self.kv_sharing_target_layer_name is not None:
+            return
+        slots = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens]
+        safe_slots = slots.to(torch.long).clamp(min=0)
+        block_size = self.k_scale_cache.shape[2]
+        block_ids = torch.div(safe_slots, block_size, rounding_mode="floor")
+        offsets = safe_slots % block_size
+        self.k_scale_cache[block_ids, :, offsets] = k_scale
+        self.v_scale_cache[block_ids, :, offsets] = v_scale
+
+    def _reshape_and_cache(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ):
+        """Scatter quantized INT8 K/V into the ND paged caches.
+
+        FIA's paged INT8 layout is ND regardless of ``VLLM_KV_CACHE_LAYOUT``,
+        so the write always uses ``use_bnsd=False`` (the device operator's
+        Norm-mode scatter).
+        """
+        if len(kv_cache) > 1:
+            self._bind_pth_caches(kv_cache)
+            if self.kv_sharing_target_layer_name is not None:
+                # KV-sharing target layers consume another layer's cache.
+                # Writing their dummy/current K/V would overwrite shared slots.
+                if self.is_kv_producer:
+                    attn_metadata.reshape_cache_event.record()
+                return query, key, value, output
+            slots = attn_metadata.slot_mapping
+            encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
+            key_to_cache = key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key
+            value_to_cache = value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value
+            slots_to_cache = slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots.to(torch.int32)
+            DeviceOperator.reshape_and_cache(
+                key=key_to_cache,
+                value=value_to_cache,
+                key_cache=self.key_cache,
+                value_cache=self.value_cache,
+                slot_mapping=slots_to_cache,
+                use_bnsd=False,
+            )
+            notify_kv_cache_written()
+        return query, key, value, output
+
+    def _pth_antiquant_args(self) -> dict[str, Any]:
+        """FIA antiquant mode 5 parameters: paged int8 KV + paged fp32 scales.
+
+        The scale caches are already the 3-D ``(num_blocks, num_kv_heads,
+        block_size)`` head-major fp32 layout FIA consumes (test_fia.py
+        contract) — the section-major raw allocation yields them contiguous
+        with no squeeze needed. The operator indexes the scales through the
+        block table. The separated ``dequant_scale_key``/``dequant_scale_value``
+        parameters are never sent: when both parameter families are supplied
+        the separated ones take precedence, so sending only the antiquant
+        scales keeps the two from ever disagreeing.
+        """
+        return {
+            "antiquant_mode": 5,
+            "key_antiquant_mode": 5,
+            "value_antiquant_mode": 5,
+            "key_antiquant_scale": self.k_scale_cache,
+            "value_antiquant_scale": self.v_scale_cache,
+        }
+
+    def _forward_pth_decode_bnsd(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        batch_size: int,
+        query_len: int,
+        seq_lens: list[int] | None = None,
+        block_table: torch.Tensor | None = None,
+        query_rows: torch.Tensor | None = None,
+        output_rows: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Uniform query length decode: FIA BNSD paged INT8, antiquant mode 5.
+
+        ``query_len == 1`` is the plain decode path (sparse_mode 0 like the
+        static C8 decode); ``query_len > 1`` (MTP/speculative decode) needs the
+        causal mask and a sparse-mode-3 paged call, matching the operator's
+        verified Q_S > 1 contract in test_fia.py.
+
+        Chunked prefill and the mixed-length decode dispatch call this once per
+        uniform-length request group, passing that group's ``seq_lens`` and
+        ``block_table`` rows plus ``query_rows``/``output_rows`` gather
+        indices (``None`` = the leading contiguous slice, the common
+        whole-batch case).
+        """
+        key, value, block_size = self._pth_kv_cache_view()
+        antiquant_args = self._pth_antiquant_args()
+        block_table = attn_metadata.block_tables if block_table is None else block_table
+        seq_lens = attn_metadata.seq_lens_list if seq_lens is None else seq_lens
+        if query_rows is None:
+            # Leading contiguous slice of the tokens-major query.
+            query_rows = torch.arange(query_offset := 0, query_offset + batch_size * query_len, device=query.device)
+        if output_rows is None:
+            output_rows = torch.arange(
+                (output_offset := 0), output_offset + batch_size * query_len, device=query.device
+            )
+        if query_len == 1:
+            # tokens-major (T, N, D) rows are one token per request: (B, N, 1, D).
+            query_bnsd = query.index_select(0, query_rows).unsqueeze(2)
+            attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                query_bnsd,
+                key,
+                value,
+                block_table=block_table,
+                actual_seq_lengths_kv=seq_lens,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="BNSD",
+                scale=self.scale,
+                block_size=block_size,
+                inner_precise=1,
+                sparse_mode=0,
+                **antiquant_args,
+            )
+            output[output_rows] = attn_output.squeeze(2)
+            return output
+        # MTP/speculative decode: every request in this group carries the same
+        # query length. Gather the group's rows then reshape to (B, N, S, D):
+        # each consecutive S-row block belongs to one request.
+        query_bnsd = (
+            query.index_select(0, query_rows)
+            .view(batch_size, query_len, self.num_heads, self.head_size)
+            .transpose(1, 2)
+        )
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+            query_bnsd,
+            key,
+            value,
+            atten_mask=attn_metadata.attn_mask,
+            block_table=block_table,
+            actual_seq_lengths=[query_len * (i + 1) for i in range(batch_size)],
+            actual_seq_lengths_kv=seq_lens,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="BNSD",
+            scale=self.scale,
+            block_size=block_size,
+            inner_precise=1,
+            sparse_mode=3,
+            **antiquant_args,
+        )
+        # (B, N, S, D) -> tokens-major (B*S, N, D), scattered back row-wise.
+        attn_output = attn_output.transpose(1, 2).reshape(-1, self.num_heads, self.head_size)
+        output[output_rows] = attn_output[: output_rows.shape[0]]
+        return output
+
+    def _forward_pth_decode(self, query: torch.Tensor, attn_metadata: AscendMetadata, output: torch.Tensor):
+        """Decode dispatch: BNSD paged INT8 antiquant mode 5 for every decode
+        shape. Uniform lengths take one call; mixed lengths (e.g. adaptive
+        verification) are grouped by query length, one mode-5 call per group.
+        TND carries no KV antiquant, so mixed batches never fall to it.
+        """
+        batch_size = len(attn_metadata.seq_lens_list)
+        num_tokens = query.shape[0]
+        if num_tokens == batch_size:
+            return self._forward_pth_decode_bnsd(query, attn_metadata, output, batch_size, 1)
+        actual_q = attn_metadata.actual_seq_lengths_q
+        if not actual_q or actual_q[-1] != num_tokens:
+            raise RuntimeError(
+                "C8 per-token-head decode query does not match actual_seq_lengths_q "
+                f"({num_tokens} tokens vs cumulative {actual_q})."
+            )
+        device = query.device
+        # Group requests by query length: one BNSD mode-5 call per distinct
+        # length. Query rows are request-major (S consecutive rows per
+        # request); each group's outputs are written back at the SAME token
+        # positions they were gathered from (tokens-major query and output
+        # rows correspond one-to-one), so the caller's token order is
+        # preserved no matter how the groups interleave.
+        starts = [0, *actual_q[:-1]]
+        by_len: dict[int, list[int]] = {}
+        for req, (start, end) in enumerate(zip(starts, actual_q)):
+            by_len.setdefault(end - start, []).append(req)
+        for q_len in sorted(by_len):
+            reqs = by_len[q_len]
+            token_rows = torch.cat([torch.arange(starts[req], starts[req] + q_len, device=device) for req in reqs])
+            self._forward_pth_decode_bnsd(
+                query,
+                attn_metadata,
+                output,
+                len(reqs),
+                q_len,
+                seq_lens=[attn_metadata.seq_lens_list[req] for req in reqs],
+                block_table=attn_metadata.block_tables[reqs],
+                query_rows=token_rows,
+                output_rows=token_rows,
+            )
+        return output
+
+    def _forward_pth_fused_infer_attention(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        float_key: torch.Tensor | None = None,
+        float_value: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """FIA TND with FLOAT KV for prefill states (mode 5 is BNSD-only).
+
+        TND does not support KV antiquant, so the prefill call carries the
+        unquantized K/V — the per-(token, head) INT8 pages are only the
+        attention cache written for later decode steps:
+
+        - PrefillNoCache: the current step's float K/V, sliced to this step's
+          tokens (no cache hit to read). ``forward`` only passes
+          ``float_key``/``float_value`` when this step's rows cover the WHOLE
+          context of every request (``seq_len == q_len`` per request), so a
+          non-None float K/V is exactly the all-new-prefill case;
+        - PrefillCacheHit / continuing chunks (``seq_len > q_len``): forward
+          leaves float K/V unset because the context extends into the paged
+          cache — gather the paged INT8 cache and dequantize to dense float
+          first (``_dequant_paged_kv_to_dense_pth``).
+        """
+        num_tokens = int(attn_metadata.actual_seq_lengths_q[-1])  # type: ignore[index]
+        query = query[:num_tokens]
+
+        if (
+            float_key is not None
+            and float_value is not None
+            and attn_metadata.attn_state == (AscendAttentionState.PrefillNoCache)
+        ):
+            if self.attn_type == AttentionType.ENCODER_DECODER:
+                raise NotImplementedError("C8 per-token-head KV cache does not support encoder-decoder attention yet.")
+            key = float_key[:num_tokens]
+            value = float_value[:num_tokens]
+            block_table = None
+            # block_table is None: FIA ignores block_size here; carry the
+            # real cache block size for consistency.
+            block_size = self.k_scale_cache.shape[2]
+            actual_seq_lengths_kv = attn_metadata.actual_seq_lengths_q
+        else:
+            key, value = self._dequant_paged_kv_to_dense_pth(
+                attn_metadata.block_tables,
+                attn_metadata.seq_lens_list,
+                query.dtype,
+            )
+            block_table = None
+            block_size = self.k_scale_cache.shape[2]
+            actual_seq_lengths_kv = attn_metadata.seq_lens_list
+
+        if block_table is None:
+            key = key.contiguous()
+            value = value.contiguous()
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+            query=query,
+            key=key,
+            value=value,
+            atten_mask=attn_metadata.attn_mask,
+            block_table=block_table,
+            input_layout="TND",
+            block_size=block_size,
+            actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            num_key_value_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            scale=self.scale,
+            sparse_mode=3,
+        )
+        attn_output = attn_output.view(-1, self.num_heads, self.head_size)[:num_tokens]
+        output[:num_tokens] = attn_output
+        return output
+
+    def _forward_pth_chunked_prefill(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        float_key: torch.Tensor | None = None,
+        float_value: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Chunked prefill: decode sub-batch via BNSD paged INT8 antiquant
+        mode 5 (grouped by query length); prefill sub-batch via TND with FLOAT
+        K/V — TND does not support KV antiquant, and the prefill rows' own
+        K/V (this chunk's new tokens) are still unquantized floats anyway.
+        Continuing chunks (no float K/V for the gathered history) dequantize
+        the paged INT8 cache to dense float first.
+        """
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        num_decodes = attn_metadata.num_decodes
+        actual_seq_qlen = attn_metadata.actual_seq_lengths_q
+        num_tokens = int(actual_seq_qlen[-1])  # type: ignore[index]
+
+        if num_decode_tokens > 0:
+            # Group the decode slice by query length; every group is a
+            # contiguous run of rows (batch is decode-first ordered), so
+            # slice views instead of gather indices.
+            decode_lens = [actual_seq_qlen[i] - (actual_seq_qlen[i - 1] if i else 0) for i in range(num_decodes)]
+            group_req = 0
+            while group_req < num_decodes:
+                group_len = decode_lens[group_req]
+                group_end = group_req
+                while group_end < num_decodes and decode_lens[group_end] == group_len:
+                    group_end += 1
+                group_reqs = range(group_req, group_end)
+                # Groups are contiguous runs (batch is decode-first ordered):
+                # rows span [first_row, last_row), gathered and written back
+                # at identical token positions.
+                first_row = actual_seq_qlen[group_req - 1] if group_req else 0
+                last_row = actual_seq_qlen[group_end - 1]
+                token_rows = torch.arange(first_row, last_row, device=query.device)
+                self._forward_pth_decode_bnsd(
+                    query,
+                    attn_metadata,
+                    output,
+                    len(group_reqs),
+                    group_len,
+                    seq_lens=[attn_metadata.seq_lens_list[r] for r in group_reqs],
+                    block_table=attn_metadata.block_tables[list(group_reqs)],
+                    query_rows=token_rows,
+                    output_rows=token_rows,
+                )
+                group_req = group_end
+
+        if attn_metadata.num_prefills > 0:
+            prefill_q = query[num_decode_tokens:num_tokens]
+            prefill_seq_qlen = [
+                actual_seq_qlen[i] - num_decode_tokens for i in range(num_decodes, len(actual_seq_qlen))
+            ]
+            if float_key is not None and float_value is not None:
+                # All-new prefill rows: forward() only passes float K/V when
+                # this step's rows cover the whole context (seq_len == q_len),
+                # so the chunk's own float K/V are the attended keys and
+                # nothing cached needs reading.
+                prefill_k = float_key[num_decode_tokens:num_tokens]
+                prefill_v = float_value[num_decode_tokens:num_tokens]
+                prefill_seq_kvlen = prefill_seq_qlen
+            else:
+                # Continuing chunk (seq_len > q_len): the query rows' new K/V
+                # have already been written to the paged INT8 cache (forward()
+                # quantized them), so gather + dequantize the FULL history to
+                # dense float — dropping it here would attend to only this
+                # chunk's rows and corrupt the output (the 1664-threshold
+                # garbled-output bug).
+                prefill_bt = attn_metadata.block_tables[num_decodes:]
+                prefill_sl = attn_metadata.seq_lens_list[num_decodes:]
+                prefill_k, prefill_v = self._dequant_paged_kv_to_dense_pth(prefill_bt, prefill_sl, query.dtype)
+                prefill_seq_kvlen = torch.tensor(prefill_sl, dtype=torch.int32).cumsum(dim=0)
+
+            prefill_out, _ = torch_npu.npu_fused_infer_attention_score(
+                query=prefill_q,
+                key=prefill_k.contiguous(),
+                value=prefill_v.contiguous(),
+                atten_mask=attn_metadata.attn_mask,
+                block_table=None,
+                input_layout="TND",
+                # block_table is None: FIA ignores block_size in this call;
+                # carry the real cache block size for consistency.
+                block_size=self.k_scale_cache.shape[2],
+                actual_seq_lengths=prefill_seq_qlen,
+                actual_seq_lengths_kv=prefill_seq_kvlen,
+                num_key_value_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                scale=self.scale,
+                sparse_mode=3,
+            )
+            n_prefill = num_tokens - num_decode_tokens
+            prefill_out = prefill_out.view(-1, self.num_heads, self.head_size)[:n_prefill]
+            output[num_decode_tokens:num_tokens] = prefill_out
+        return output
+
+    def _forward_pth_attention(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        float_key: torch.Tensor | None = None,
+        float_value: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Phase dispatch. Decode always runs BNSD antiquant mode 5; prefill
+        runs TND on float K/V (mode 5 is BNSD-only)."""
+        if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+            return self._forward_pth_decode(query, attn_metadata, output)
+        if attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill:
+            return self._forward_pth_chunked_prefill(query, attn_metadata, output, float_key, float_value)
+        return self._forward_pth_fused_infer_attention(query, attn_metadata, output, float_key, float_value)
+
+    def forward_impl(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ):
+        # PagedAttention has no INT8-antiquant kernel: decode runs FIA
+        # antiquant mode 5, prefill runs float-KV TND — never npu_paged_attention.
+        return self._forward_pth_attention(query, attn_metadata, output, key, value)
+
+    def full_graph_fia(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        layer=None,
+    ) -> torch.Tensor:
+        """Capture-path FIA: paged INT8 KV + paged scales, antiquant mode 5.
+
+        The antiquant parameters are static per-layer (the bound scale caches
+        have stable addresses), so the FIAParamProvider only refreshes the
+        per-step lengths and block table on replay, exactly like the base
+        capture path.
+        """
+        if not self.enable_c8_pth_quant:
+            return super().full_graph_fia(query, key, value, attn_metadata, output, layer)
+
+        key, value, block_size = self._pth_kv_cache_view()
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
+        softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
+        output_view = output[: attn_metadata.num_actual_tokens]
+        # BNSD is the only layout that carries KV antiquant, so every capture
+        # state runs the BNSD paged call — the same single-call contract as the
+        # static C8 capture path. Uniform single-token captures skip the mask;
+        # uniform multi-row captures (MTP Q_S > 1) take the causal mask +
+        # sparse mode 3, matching the operator's Q_S > 1 contract in
+        # test_fia.py.
+        q_lens = [end - start for start, end in zip([0, *actual_seq_lengths_q[:-1]], actual_seq_lengths_q)]
+        input_layout = "BNSD"
+        if len(set(q_lens)) == 1 and q_lens[0] == 1:
+            attn_mask = None
+            sparse_mode = 0
+            pre_tokens = SWA_INT_MAX
+            next_tokens = SWA_INT_MAX
+            actual_seq_lengths = None
+            query = query.unsqueeze(2)
+            output_view = output_view.unsqueeze(2)
+        elif len(set(q_lens)) == 1:
+            attn_mask = attn_metadata.attn_mask
+            sparse_mode = 3
+            pre_tokens = SWA_INT_MAX
+            next_tokens = SWA_INT_MAX
+            actual_seq_lengths = [q_lens[0] * (i + 1) for i in range(len(q_lens))]
+            query = query.view(-1, q_lens[0], self.num_heads, self.head_size).transpose(1, 2)
+            output_view = output_view.view(-1, q_lens[0], self.num_heads, self.head_size).transpose(1, 2)
+        else:
+            # The scheduler/graph bucket pads decode batches to uniform query
+            # lengths; mixed lengths never reach capture.
+            raise NotImplementedError(
+                "C8 per-token-head graph capture requires uniform query lengths "
+                f"(got {q_lens}); enable the chunked-prefill fallback or report this path."
+            )
+
+        extra_args = {
+            **self._pth_antiquant_args(),
+            "inner_precise": 1,
+        }
+        block_table = attn_metadata.block_tables
+        actual_seq_lengths_kv = attn_metadata.seq_lens_list
+
+        use_max_workspace = self._use_max_workspace_for_fia_graph
+        workspace = get_capture_resource(
+            _FIA_WORKSPACE_KEY,
+            lambda: torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                query=query,
+                key=key,
+                value=value,
+                atten_mask=attn_mask,
+                block_table=block_table,
+                input_layout=input_layout,
+                block_size=block_size,
+                actual_seq_lengths=actual_seq_lengths,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                num_key_value_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                pre_tokens=pre_tokens,
+                next_tokens=next_tokens,
+                scale=self.scale,
+                sparse_mode=sparse_mode,
+                **extra_args,
+            ),
+            use_max_workspace,
+        )
+        register_task(
+            torch_npu.npu_fused_infer_attention_score.out,
+            {
+                "query": query,
+                "key": key,
+                "value": value,
+                "atten_mask": attn_mask,
+                "block_table": block_table,
+                "input_layout": input_layout,
+                "block_size": block_size,
+                "actual_seq_lengths": actual_seq_lengths,
+                "actual_seq_lengths_kv": actual_seq_lengths_kv,
+                "num_key_value_heads": self.num_kv_heads,
+                "num_heads": self.num_heads,
+                "pre_tokens": pre_tokens,
+                "next_tokens": next_tokens,
+                "scale": self.scale,
+                "sparse_mode": sparse_mode,
+                "workspace": workspace,
+                "out": [output_view, softmax_lse],
+                **extra_args,
+            },
+            FIAParamProvider(
+                self._layer_name,
+                self.sliding_window,
+                _EXTRA_CTX.is_draft_model,
+                is_non_pa=False,
+            ),
+        )
+        return output, num_tokens
+
+    def forward(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert output is not None, "Output tensor must be provided."
+        self._require_fia_antiq_support()
+        self._layer_name = layer.layer_name
+
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError(
+                "fused output quantization is not yet supported for AscendC8PerTokenHeadAttentionBackendImpl"
+            )
+
+        num_tokens = query.shape[0]
+        if attn_metadata is None:
+            return output.fill_(0)
+        self._bind_pth_caches(kv_cache)
+
+        # This step's unquantized K/V. They are usable as attention keys only
+        # when they cover the WHOLE context of every prefill request in this
+        # step (seq_len == this step's query rows): a fresh prefill with no
+        # cached history. A continuing chunk also carries its new K/V here,
+        # but its context extends into the paged cache — the TND prefill call
+        # must then gather + dequantize the full history instead.
+        float_key, float_value = None, None
+        prefill_covers_context = False
+        if key is not None and value is not None:
+            if (
+                attn_metadata.attn_state
+                in (
+                    AscendAttentionState.PrefillNoCache,
+                    AscendAttentionState.ChunkedPrefill,
+                )
+                and self.attn_type != AttentionType.ENCODER_DECODER
+            ):
+                prefill_covers_context = all(
+                    seq_len == q_len
+                    for seq_len, q_len in zip(attn_metadata.seq_lens_list, _per_request_query_lens(attn_metadata))
+                )
+            if prefill_covers_context:
+                float_key, float_value = key, value
+            k_int8, v_int8, k_scale, v_scale = self._quantize_kv_per_token_head(
+                key, value, attn_metadata.num_actual_tokens
+            )
+            query, key, value, _ = self._reshape_and_cache(query, k_int8, v_int8, kv_cache, attn_metadata, output)
+            self._scatter_pth_scale_caches(k_scale, v_scale, attn_metadata)
+
+        # pooling models run bidirectional encoder attention on the float K/V
+        # (they have no paged KV cache to read).
+        if attn_metadata.model_runner_type == "pooling" and (
+            not attn_metadata.causal or self.attn_type == AttentionType.ENCODER_ONLY
+        ):
+            attn_output = self._forward_encoder_attention(query, float_key, float_value, attn_metadata, output)
+            output[:num_tokens] = attn_output[:num_tokens]
+            return output
+
+        if _EXTRA_CTX.capturing:
+            attn_output, num_tokens_out = self.full_graph_fia(
+                query, float_key, float_value, attn_metadata, output, layer
+            )
+            output[:num_tokens] = attn_output[:num_tokens]
+            return output
+        return self._forward_pth_attention(query, attn_metadata, output, float_key, float_value)

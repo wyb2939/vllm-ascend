@@ -64,6 +64,7 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
 )
+from vllm_ascend.attention.attention_c8_pth import C8_PTH_SCALE_DTYPE, c8_pth_cache_spec, c8_pth_cache_views_for_spec
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
@@ -114,6 +115,7 @@ from vllm_ascend.utils import (
     enable_sfa,
     get_kv_cache_tensor_layers,
     is_c8_mxfp_kv_quant,
+    is_c8_pth_kv_quant,
     is_hidden_state_cache_spec,
     kv_cache_spec_uses_packed_sfa_main_cache,
     vllm_version_is,
@@ -246,6 +248,8 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             spec = customize_attention_spec(attn_module.get_attn_backend(), spec)
         if type(spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
             spec = mxfp_cache_spec(spec)
+        if type(spec) is FullAttentionSpec and is_c8_pth_kv_quant(vllm_config):
+            spec = c8_pth_cache_spec(spec)
         kv_cache_spec[layer_name] = spec
         if isinstance(spec, AttentionSpec) and getattr(attn_module, "align_kv_cache_with_mamba", True):
             attention_layer_names.append(layer_name)
@@ -257,6 +261,31 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             # layers construct their specs. Keep indexer/draft pages native.
             kv_cache_spec.update(mamba_specs)
             return kv_cache_spec
+        # C8-PTH: the upstream hybrid pool aliases every group's block b to the
+        # SAME byte tile (block-outer packing, "Groups alias from byte 0"), so a
+        # shared block id must cover the same TOKEN RANGE in every group. With
+        # the per-(token, head) recipe the full-attn group runs its own
+        # candidate scheduler block (e.g. 1664) while MambaSpec keeps its
+        # default checkpoint block (max_model_len, e.g. 8192) — the mismatch
+        # makes full-attn KV pages and Mamba conv/ssm states interleave inside
+        # one tile and corrupts the recurrent states from the second chunk on.
+        # Align the mamba checkpoint block to the attention block (page bytes
+        # are per-state-slot and unaffected). This must run BEFORE the page
+        # padding below so the equal-page precondition holds on the final specs.
+        if any(is_c8_pth_kv_quant(vllm_config) and type(spec) is FullAttentionSpec for spec in kv_cache_spec.values()):
+            attention_block_size = next(
+                spec.block_size for spec in kv_cache_spec.values() if type(spec) is FullAttentionSpec
+            )
+            for layer_name, spec in mamba_specs.items():
+                if spec.block_size != attention_block_size:
+                    logger.warning(
+                        "C8 per-token-head hybrid pool: aligning mamba block size "
+                        "%d -> %d to keep the shared-pool block id token ranges "
+                        "consistent across groups.",
+                        spec.block_size,
+                        attention_block_size,
+                    )
+                    mamba_specs[layer_name] = replace(spec, block_size=attention_block_size)
         # QSA/CSA hybrid models (descriptor-native cache owners) need
         # the descriptor-native cache alignment: every align_kv_cache_with_mamba
         # attention layer (including the QSA main owners) pads its page up
@@ -1259,6 +1288,28 @@ def _allocate_kv_cache(
         example_layer_name = shared_names[0]
         example_spec = layer_kv_cache_spec[example_layer_name]
 
+        # C8-PTH full-attention layers cannot join the hybrid backing overlay:
+        # the pool aliases every group from byte 0 (block-outer packing) and
+        # addresses block b at b * bytes_per_block, while the C8 section-major
+        # layout — required by the FIA tiling path — places block b's K at
+        # b * kernel_payload with K/V/scales as whole contiguous runs. The two
+        # coordinate systems interleave: full-attn KV pages land inside mamba
+        # conv/ssm state tiles and corrupt the recurrent states (intermittent
+        # garbage from the second chunk on). Give these layers their own
+        # allocations; the mamba group keeps the hybrid overlay, whose members
+        # all use page-pitch addressing.
+        if is_c8_pth_kv_quant(vllm_config) and any(
+            type(layer_kv_cache_spec[name]) is FullAttentionSpec for name in shared_names
+        ):
+            for layer_name in shared_names:
+                layer_spec = layer_kv_cache_spec[layer_name]
+                kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(
+                    kv_cache_config.num_blocks * layer_spec.page_size_bytes,
+                    alignment,
+                    device,
+                )
+            continue
+
         # extract_hidden_states dumps are live at the same time as the target
         # model's Attention/Mamba caches. Keep HiddenStateCacheSpec off the
         # #51718 hybrid backing so float32 SSM writes cannot overlay bfloat16
@@ -1420,6 +1471,10 @@ def _allocate_kv_cache(
                     continue
                 if is_c8_mxfp_kv_quant(vllm_config):
                     # One packet-backed allocation holds K, V and both scales.
+                    kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
+                    continue
+                if is_c8_pth_kv_quant(vllm_config):
+                    # One combined allocation holds [K | V | K_scale | V_scale].
                     kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
                     continue
                 if attn_layers is None:
@@ -1631,6 +1686,15 @@ def _reshape_kv_cache_v2(
                 if not isinstance(raw_cache, torch.Tensor):
                     raise ValueError("C8_MXFP requires one combined raw allocation per layer.")
                 kv_caches[layer_name] = mxfp_cache_views_for_spec(raw_cache, kv_cache_spec, kernel_block_size)
+                continue
+
+            if type(kv_cache_spec) is FullAttentionSpec and is_c8_pth_kv_quant(vllm_config):
+                raw_cache = kv_cache_raw_tensors[layer_name]
+                if not isinstance(raw_cache, torch.Tensor):
+                    raise ValueError("C8 per-token-head requires one combined raw allocation per layer.")
+                kv_caches[layer_name] = c8_pth_cache_views_for_spec(
+                    raw_cache, kv_cache_spec, kernel_block_size, C8_PTH_SCALE_DTYPE
+                )
                 continue
 
             if qwen4_cache_layout is not None:

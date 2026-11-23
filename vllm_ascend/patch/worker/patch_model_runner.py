@@ -3,6 +3,7 @@
 
 from contextlib import AbstractContextManager
 
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as upstream
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp as _dispatch_cg_and_sync_dp
@@ -59,6 +60,24 @@ def initialize_kv_cache(
         # Let each cache type account for CP. Attention KV is DCP-sharded,
         # while Mamba/GDN recurrent state is replicated across DCP ranks.
         max_num_blocks = spec.max_num_blocks_per_req(self.vllm_config, block_table_max_model_len)
+        # C8-PTH hybrid: get_kv_cache_spec aligns the Mamba checkpoint block to
+        # the attention block so the shared-pool overlay keeps one token range
+        # per block id. In non-align mamba mode
+        # MambaSpec.max_num_blocks_per_req then still returns
+        # cdiv(max_memory_usage_bytes, page_size_bytes) = 1 + num_speculative_blocks,
+        # which implicitly assumed block_size == max_model_len (one state slot per
+        # REQUEST). With a shrunken checkpoint block a request accumulates one
+        # state block per checkpoint interval, so the row must cover the whole
+        # sequence — the same width the align mode already uses.
+        if (
+            isinstance(layer_spec, upstream.MambaSpec)
+            and layer_spec.mamba_cache_mode != "align"
+            and layer_spec.block_size < block_table_max_model_len
+        ):
+            max_num_blocks = max(
+                max_num_blocks,
+                cdiv(block_table_max_model_len, layer_spec.block_size) + layer_spec.num_speculative_blocks,
+            )
         # Preserve each cache type's alignment requirements after applying
         # its topology-aware block-table width.
         max_num_blocks = upstream.get_block_table_width(

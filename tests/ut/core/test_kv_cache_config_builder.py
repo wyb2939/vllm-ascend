@@ -10,7 +10,7 @@ release-lane monkey patches.
 """
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -59,6 +59,47 @@ def make_runtime():
 def generic_specs():
     spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=16, dtype=torch.bfloat16)
     return {"layer.a": spec, "layer.b": spec}
+
+
+def test_c8_pth_hybrid_pool_bytes_sum_attn_and_one_mamba_tile():
+    """C8-PTH hybrid: the attention group pays one page per LAYER (private
+    backing), while the aliased mamba groups pay one TILE per block id (max
+    over mamba groups of their per-block layer span). Summing every mamba
+    layer would double-count the aliased tiles and under-size num_blocks."""
+    runtime = make_runtime()
+    runtime.cache_config = SimpleNamespace(cache_dtype="int8")
+    runtime.quant_config = SimpleNamespace(_has_c8_pth_recipe=True)
+    # Attention group: 2 layers; mamba groups: 2 layers each, 3 aliased groups.
+    attn_spec = FullAttentionSpec(block_size=4, num_kv_heads=1, head_size=8, dtype=torch.int8)
+    mamba_spec = MambaSpec(block_size=4, shapes=((4, 8),), dtypes=(torch.float32,))
+    attn_group = KVCacheGroupSpec(layer_names=["a0", "a1"], kv_cache_spec=attn_spec)
+    mamba_groups = [
+        KVCacheGroupSpec(layer_names=[f"m{g}{i}" for i in range(2)], kv_cache_spec=mamba_spec) for g in range(3)
+    ]
+    builder = AscendKVCacheConfigBuilder()
+    pool_bytes = builder._get_pool_bytes_per_block(runtime, [attn_group, *mamba_groups])
+
+    attn_cost = 2 * attn_spec.page_size_bytes  # private per-layer regions
+    mamba_tile = 2 * mamba_spec.page_size_bytes  # one tile per block id (aliased)
+    assert pool_bytes == attn_cost + mamba_tile
+
+
+def test_c8_pth_hybrid_pool_accounting_requires_the_recipe():
+    """Without the C8-PTH recipe the generic hybrid pool keeps its aliased
+    accounting (max over groups) — the sum hook must not fire."""
+    runtime = make_runtime()
+    runtime.cache_config = SimpleNamespace(cache_dtype="auto")
+    runtime.quant_config = None
+    attn_spec = FullAttentionSpec(block_size=4, num_kv_heads=1, head_size=8, dtype=torch.bfloat16)
+    mamba_spec = MambaSpec(block_size=4, shapes=((4, 8),), dtypes=(torch.float32,))
+    groups = [
+        KVCacheGroupSpec(layer_names=["a0", "a1"], kv_cache_spec=attn_spec),
+        KVCacheGroupSpec(layer_names=["m0", "m1"], kv_cache_spec=mamba_spec),
+    ]
+    builder = AscendKVCacheConfigBuilder()
+    with patch.object(DefaultKVCacheConfigBuilder, "_get_pool_bytes_per_block", return_value=12345) as default_pool:
+        assert builder._get_pool_bytes_per_block(runtime, groups) == 12345
+    default_pool.assert_called_once()
 
 
 def test_kimi_k31_grouping_precedes_generic_hybrid_promotion(monkeypatch):

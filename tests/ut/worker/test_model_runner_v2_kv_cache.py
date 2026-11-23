@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.worker.gpu import model_runner as upstream
 
 from vllm_ascend.patch.worker import patch_model_runner  # noqa: F401
@@ -145,3 +145,68 @@ def test_mrv2_block_copy_preserves_segmented_mamba_storage():
     torch.testing.assert_close(ssm[:2], before_ssm[:2])
     torch.testing.assert_close(ring_start, torch.tensor([10, 20, 10], dtype=torch.int32))
     torch.testing.assert_close(num_committed, torch.tensor([1, 2, 1], dtype=torch.int32))
+
+
+def test_mrv2_block_table_widens_non_align_mamba_rows_for_aligned_blocks():
+    """C8-PTH hybrid aligns the mamba checkpoint block to the attention block;
+    in non-align mode MambaSpec.max_num_blocks_per_req still reports one state
+    slot per REQUEST (1 + num_speculative_blocks), which only holds when the
+    block covers max_model_len. The vendored block-table sizing must widen the
+    row to cdiv(max_len, block) + num_speculative_blocks, or append_block_ids
+    raises 'exceeds row capacity' on the second checkpoint of a long request."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    runner = MagicMock()
+    runner.device = torch.device("cpu")
+    runner.is_encoder_decoder = False
+    runner.speculator = None
+    runner.vocab_size = 16
+    runner.max_model_len = 8192
+    runner.cache_config.kv_sharing_fast_prefill = False
+    runner.vllm_config.aux_output_config.enabled = False
+    runner.jit_warmup_registry.activate.side_effect = nullcontext
+    runner.kernel_block_sizes = [128, 128]
+
+    mamba_spec = MambaSpec(
+        block_size=1664,
+        shapes=((4, 512),),
+        dtypes=(torch.float32,),
+    )
+    full_spec = upstream.FullAttentionSpec(block_size=1664, num_kv_heads=2, head_size=256, dtype=torch.bfloat16)
+    config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["model.layers.0.linear_attn"], kv_cache_spec=mamba_spec),
+            KVCacheGroupSpec(layer_names=["model.layers.1.self_attn"], kv_cache_spec=full_spec),
+        ],
+    )
+
+    captured = {}
+
+    class FakeBlockTables:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    with (
+        patch.object(upstream, "init_attn_backend", return_value=([], MagicMock(), [])),
+        patch.object(upstream, "maybe_create_adaptive_verification_manager", return_value=None),
+        patch.object(upstream, "BlockTables", FakeBlockTables),
+        patch.object(upstream.pcp, "maybe_build_pcp_manager", return_value=None),
+        patch.object(upstream, "maybe_build_ubatch_runner", return_value=None),
+        patch.object(upstream, "initialize_mamba_ssu_backend"),
+        patch.object(upstream, "has_compiled_submodule", return_value=False),
+        patch.object(upstream, "ModelCudaGraphManager"),
+        patch.object(upstream, "check_attention_cp_compatibility"),
+        patch.object(upstream, "init_kv_cache", return_value={"mamba": [torch.empty(4)], "attn": torch.empty(4)}),
+        patch.object(upstream, "get_kv_connector"),
+    ):
+        upstream.GPUModelRunner.initialize_kv_cache(runner, config, is_profiling=False)
+
+    mamba_width = captured["max_num_blocks_per_group"][0]
+    full_width = captured["max_num_blocks_per_group"][1]
+    # Full-attn (align-like spec): cdiv(8192, 1664) = 5.
+    assert full_width >= 5
+    # Mamba non-align previously reported 1 + 0 = 1; the widened row must cover
+    # the whole sequence at the aligned checkpoint interval.
+    assert mamba_width == 5, f"mamba row width {mamba_width}, expected 5"

@@ -351,6 +351,53 @@ def test_hybrid_allocator_keeps_shared_backing_with_pa_configured(monkeypatch, p
     assert raw_caches[attn_name].data_ptr() == raw_caches[mamba_name].data_ptr()
 
 
+def test_hybrid_allocator_gives_c8_pth_attention_its_own_backing(monkeypatch):
+    """The hybrid pool aliases every group from byte 0 (block-outer tiles), but
+    the C8-PTH section-major layout addresses block b at b * kernel payload —
+    the two coordinate systems interleave and full-attn KV pages corrupt mamba
+    conv/ssm states. C8-PTH full-attn descriptors must get private allocations;
+    the mamba group keeps the hybrid backing overlay."""
+    attn_name = "model.layers.0.self_attn.attn"
+    mamba_name = "model.layers.1.linear_attn"
+    attn_spec = FullAttentionSpec(block_size=2, num_kv_heads=1, head_size=4, dtype=torch.int8)
+    mamba_spec = MambaSpec(block_size=2, shapes=((2, 4),), dtypes=(torch.float32,))
+    backing_size = 3 * attn_spec.page_size_bytes
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=backing_size,
+                layers=[name],
+                layer_stride=backing_size,
+                block_stride=spec.page_size_bytes,
+                offset=0,
+            )
+            for name, spec in ((attn_name, attn_spec), (mamba_name, mamba_spec))
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)
+            for name, spec in ((attn_name, attn_spec), (mamba_name, mamba_spec))
+        ],
+    )
+    vllm_config = SimpleNamespace(
+        additional_config={},
+        kv_transfer_config=None,
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        cache_config=SimpleNamespace(cache_dtype="int8"),
+        quant_config=SimpleNamespace(_has_c8_pth_recipe=True),
+    )
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: vllm_config)
+    monkeypatch.setattr(attn_utils, "get_current_hardware_profile", lambda: get_hardware_profile(AscendDeviceType.A3))
+    raw_caches = attn_utils._allocate_kv_cache(config, shared_layers={}, device=torch.device("cpu"))
+
+    assert all(isinstance(raw, torch.Tensor) for raw in raw_caches.values())
+    # Mamba keeps the shared hybrid backing slice (page-pitch addressing).
+    assert raw_caches[mamba_name].numel() == backing_size
+    # C8-PTH attention gets a private per-layer allocation with its own storage.
+    assert raw_caches[attn_name].numel() == 3 * attn_spec.page_size_bytes
+    assert raw_caches[attn_name].untyped_storage().data_ptr() != raw_caches[mamba_name].untyped_storage().data_ptr()
+
+
 def test_hybrid_attention_layout_preserves_padding(monkeypatch):
     name = "model.layers.0.self_attn.attn"
     spec = FullAttentionSpec(block_size=2, num_kv_heads=1, head_size=4, dtype=torch.float16, page_size_padded=64)
@@ -2868,6 +2915,96 @@ def test_get_kv_cache_spec_keeps_plain_spec_without_mxfp8(monkeypatch):
 
     assert spec.dtype == torch.bfloat16
     assert spec.state_content_bytes is None
+
+
+def test_get_kv_cache_spec_aligns_mamba_block_to_c8_pth_attention_block(monkeypatch):
+    """The hybrid pool aliases every group's block b to the same byte tile, so a
+    shared block id must cover the same token range in every group. With the
+    C8-PTH recipe the full-attn group runs its candidate scheduler block while
+    MambaSpec defaults to max_model_len — align the mamba checkpoint block to
+    the attention block, or full-attn KV pages and mamba conv/ssm states
+    interleave inside one tile and corrupt the recurrent states."""
+    full_spec = _plain_full_attention_spec()
+    full_spec = replace(full_spec, block_size=1664)
+    mamba_spec = MambaSpec(
+        block_size=8192,
+        shapes=((4, 512),),
+        dtypes=(torch.float32,),
+    )
+    attn_module = SimpleNamespace(
+        is_draft_layer=False,
+        get_kv_cache_spec=lambda _cfg: full_spec,
+        get_attn_backend=lambda: AscendAttentionBackend,
+    )
+    gdn_module = SimpleNamespace(
+        is_draft_layer=False,
+        get_kv_cache_spec=lambda _cfg: mamba_spec,
+        get_attn_backend=lambda: AscendAttentionBackend,
+    )
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=None,
+        cache_config=SimpleNamespace(cache_dtype="int8"),
+        attention_config=AttentionConfig(indexer_kv_dtype="auto"),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="qwen3_next")),
+        quant_config=SimpleNamespace(_has_c8_pth_recipe=True),
+    )
+    monkeypatch.setattr(
+        attn_utils,
+        "get_layers_from_vllm_config",
+        lambda _cfg, _type: {"model.layers.1.self_attn": attn_module, "model.layers.0.linear_attn": gdn_module},
+    )
+    monkeypatch.setattr(attn_utils, "kv_cache_dtype_str_to_dtype", lambda _s, _m: torch.int8)
+    monkeypatch.setattr(attn_utils, "get_current_hardware_profile", lambda: get_hardware_profile(AscendDeviceType.A3))
+
+    specs = attn_utils.get_kv_cache_spec(vllm_config)
+
+    gdn_spec = specs["model.layers.0.linear_attn"]
+    full_ret = specs["model.layers.1.self_attn"]
+    # The mamba checkpoint block must now match the attention block.
+    assert gdn_spec.block_size == full_ret.block_size == 1664
+    # And the page budget is unchanged per state slot (state_content_bytes-based).
+    assert gdn_spec.page_size_bytes == mamba_spec.page_size_bytes
+
+
+def test_get_kv_cache_spec_keeps_mamba_block_without_c8_pth(monkeypatch):
+    """Without the C8-PTH recipe the mamba block stays as the model config set
+    it (e.g. max_model_len) — the alignment is recipe-scoped."""
+    full_spec = _plain_full_attention_spec()
+    full_spec = replace(full_spec, block_size=1664)
+    mamba_spec = MambaSpec(
+        block_size=8192,
+        shapes=((4, 512),),
+        dtypes=(torch.float32,),
+    )
+    attn_module = SimpleNamespace(
+        is_draft_layer=False,
+        get_kv_cache_spec=lambda _cfg: full_spec,
+        get_attn_backend=lambda: AscendAttentionBackend,
+    )
+    gdn_module = SimpleNamespace(
+        is_draft_layer=False,
+        get_kv_cache_spec=lambda _cfg: mamba_spec,
+        get_attn_backend=lambda: AscendAttentionBackend,
+    )
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=None,
+        cache_config=SimpleNamespace(cache_dtype="auto"),
+        attention_config=AttentionConfig(indexer_kv_dtype="auto"),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="qwen3_next")),
+        quant_config=None,
+    )
+    monkeypatch.setattr(
+        attn_utils,
+        "get_layers_from_vllm_config",
+        lambda _cfg, _type: {"model.layers.1.self_attn": attn_module, "model.layers.0.linear_attn": gdn_module},
+    )
+    monkeypatch.setattr(attn_utils, "kv_cache_dtype_str_to_dtype", lambda _s, _m: torch.bfloat16)
+
+    specs = attn_utils.get_kv_cache_spec(vllm_config)
+
+    assert specs["model.layers.0.linear_attn"].block_size == 8192
 
 
 @pytest.mark.parametrize("head_size_v", [64, 128])

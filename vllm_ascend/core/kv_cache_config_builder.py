@@ -23,6 +23,7 @@ from vllm.v1.core.kv_cache_planning import (
 from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
@@ -47,6 +48,7 @@ from vllm_ascend.models.qwen4_exp.cache_config import (
 )
 from vllm_ascend.quantization.methods.kv_cache.turboquant import TURBOQUANT_CACHE_DTYPE
 from vllm_ascend.quantization.methods.kv_cache.turboquant import cache as tq_cache
+from vllm_ascend.utils import is_c8_pth_kv_quant
 
 
 class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
@@ -111,7 +113,58 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
             return tq_cache.pool_bytes_per_block(kv_cache_groups)
         if _is_deepseek_v4_groups(kv_cache_groups):
             return _deepseek_v4_pool_bytes_per_block(kv_cache_groups)
+        # C8-PTH hybrid: the full-attn group gets its own device backing
+        # (section-major layout cannot join the block-outer tile overlay the
+        # mamba group uses — see _allocate_kv_cache), so the attention group
+        # pays one page per LAYER, while the mamba groups still alias from
+        # byte 0 and pay one TILE per block ID (max over mamba groups of their
+        # per-block layer span). Summing every mamba layer would double-count
+        # the aliased tiles and under-size num_blocks by the mamba layer count.
+        if _is_c8_pth_hybrid_groups(kv_cache_groups) and is_c8_pth_kv_quant(vllm_config):
+            attn_cost = mamba_cost = 0
+            for group in kv_cache_groups:
+                group_cost = sum(layer.page_size_bytes for layer in _group_layer_specs(group))
+                if type(_group_first_spec(group)) is MambaSpec:
+                    mamba_cost = max(mamba_cost, group_cost)
+                else:
+                    attn_cost += group_cost
+            return attn_cost + mamba_cost
         return super()._get_pool_bytes_per_block(vllm_config, kv_cache_groups)
+
+
+def _group_first_spec(group: KVCacheGroupSpec) -> KVCacheSpec:
+    spec = group.kv_cache_spec
+    return spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+
+
+def _group_layer_specs(group: KVCacheGroupSpec) -> list[KVCacheSpec]:
+    """Per-layer cache specs of one group, expanded per LAYER.
+
+    The allocator gives every layer its own ``num_blocks * page`` region
+    (hybrid branch slices ``[idx * layer_stride, ...]`` per layer; the C8-PTH
+    attention branch allocates privately per layer), so a group's span is
+    ``len(group.layer_names) * page`` — a merged/plain spec is ONE object
+    shared by all the group's layers and must be repeated per layer. Dropping
+    this multiplication under-counted the pool 4x and OOM'd.
+    """
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return list(spec.kv_cache_specs.values())
+    return [spec] * len(group.layer_names)
+
+
+def _is_c8_pth_hybrid_groups(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
+    """Whether one block ID must pay for both a C8-PTH attention page and a
+    mamba state page — i.e. the C8-PTH recipe with a mamba group present."""
+    specs = [
+        (
+            group.kv_cache_spec.first_spec
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else group.kv_cache_spec
+        )
+        for group in kv_cache_groups
+    ]
+    return any(type(spec) is MambaSpec for spec in specs) and len({type(spec) for spec in specs}) > 1
 
 
 def _page_sizes(spec: UniformTypeKVCacheSpecs) -> set[int]:

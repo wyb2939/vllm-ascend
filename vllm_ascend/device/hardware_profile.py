@@ -169,6 +169,11 @@ class HardwareCapability(Enum):
     RMS_NORM_CAST = auto()
     # Fused RMSNorm and dynamic per-token INT8 quantization on A3.
     RMS_NORM_DYNAMIC_QUANT = auto()
+    # ``npu_fused_infer_attention_score`` antiquant mode 5 (C8A16): the kernel
+    # dequantizes paged INT8 KV caches in-kernel with per-(token, head) scales
+    # against a BF16/FP16 query, for both the Q_S == 1 decode path and the
+    # newly supported Q_S > 1 paths. A2/A3 only; A5 uses its own QFA stack.
+    FIA_ANTIQ_PER_TOKEN_HEAD = auto()
     # Import and register the compiled vLLM-Ascend custom-op library at runtime.
     # This is independent of whether custom ops are enabled by default.
     RUNTIME_CUSTOM_OPS = auto()
@@ -338,6 +343,7 @@ _STANDARD_CAPABILITIES = frozenset(
         HardwareCapability.ATB_EXTENSIONS,
         HardwareCapability.ATB_WARMUP,
         HardwareCapability.BGMV_SGMV_META_REGISTRATION,
+        HardwareCapability.FIA_ANTIQ_PER_TOKEN_HEAD,
         HardwareCapability.FLA_GDN_PREFILL,
         HardwareCapability.FUSED_ROTARY_MUL_INTERLEAVE,
         HardwareCapability.FUSED_SWIGLU_TUNING_ARGS,

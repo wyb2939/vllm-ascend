@@ -46,7 +46,9 @@ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
     C8_MXFP_KV_CACHE_DTYPE,
+    C8_PTH_KV_CACHE_TYPE,
     calc_split_factor,
+    is_c8_pth_kv_quant,
 )
 
 from ..methods import get_scheme_class
@@ -598,7 +600,10 @@ class AscendModelSlimConfig(QuantizationConfig):
                 self.quant_description.get("fa_quant_type", ""),
             )
             self.enable_fa_quant = False
-        if self.enable_c8_quant:
+        if self.enable_c8_quant or self.enable_c8_pth_quant:
+            # C8_PER_TOKEN_HEAD checkpoints may still emit the legacy static
+            # C8 scale keys; the per-(token, head) method registers neutral
+            # placeholder parameters that accept (but never consume) them.
             suffix_map.update(
                 {
                     ".k_proj.kv_cache_scale": ".attn.k_cache_scale",
@@ -879,6 +884,13 @@ class AscendModelSlimConfig(QuantizationConfig):
 
                 scheme = AscendC8KVCacheAttentionMethod(self.quant_description, prefix)
                 logger.debug("Select AscendKVCacheMethod(C8) for %s (layer=%s)", prefix, "AttentionLayerBase[C8]")
+            elif self.enable_c8_pth_quant and self._is_full_attention_layer(layer):
+                from ..methods.kv_cache.kv_c8_pth import AscendC8PerTokenHeadKVCacheAttentionMethod
+
+                scheme = AscendC8PerTokenHeadKVCacheAttentionMethod(self.quant_description, prefix)
+                logger.debug(
+                    "Select AscendKVCacheMethod(C8-PTH) for %s (layer=%s)", prefix, "AttentionLayerBase[C8-PTH]"
+                )
             elif self.enable_mxfp_c8_quant and self._is_full_attention_layer(layer):
                 if self._has_mxfp_c8_recipe is False:
                     logger.warning_once(
@@ -978,6 +990,28 @@ class AscendModelSlimConfig(QuantizationConfig):
         if vllm_config is None:
             return False
         return vllm_config.cache_config.cache_dtype == C8_MXFP_KV_CACHE_DTYPE
+
+    @property
+    def _has_c8_pth_recipe(self) -> bool:
+        """Whether the checkpoint carries the per-(token, head) INT8 KV cache
+        recipe (model-wide ``kv_cache_type: "C8_PER_TOKEN_HEAD"``). This is
+        NOT the switch — ``is_c8_pth_kv_quant`` additionally requires
+        ``--kv-cache-dtype int8`` and the A2/A3 hardware gate."""
+        return self.quant_description.get("kv_cache_type", "") == C8_PTH_KV_CACHE_TYPE
+
+    @property
+    def enable_c8_pth_quant(self) -> bool:
+        """FIA antiquant-mode-5 KV cache (``kv_cache_type: C8_PER_TOKEN_HEAD`` +
+        ``--kv-cache-dtype int8``, A2/A3 only).
+
+        Same model-config-time semantics as ``enable_mxfp_c8_quant``: False
+        while the engine config is still being assembled, so quant-config
+        constructors and weight mappers never take a C8-PTH decision too early.
+        """
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            return False
+        return is_c8_pth_kv_quant(vllm_config)
 
     @property
     def _has_mxfp_c8_recipe(self) -> bool:
