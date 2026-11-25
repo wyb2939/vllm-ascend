@@ -5,6 +5,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from tests.ut.base import TestBase
@@ -282,6 +283,26 @@ class TestAscendC8PerTokenHeadBackendImpl(TestBase):
         # block 1, and the chunk's own rows landed in block 1 (slot >= bs).
         torch.testing.assert_close(kwargs["key"][:_BLOCK], (kv_cache[0][0] * 2.0).to(torch.bfloat16))
         self.assertGreater(kwargs["key"].shape[0], _BLOCK)
+
+    def test_forward_rejects_non_mooncake_kv_transfer(self):
+        """PD disaggregation moves per-layer cache tensors; connectors other
+        than Mooncake carry only the K/V pair and would drop the fp32 scale
+        caches — the D instance would dequantize INT8 pages into garbage.
+        The forward must refuse loudly instead."""
+        impl = self._make_impl()
+        kv_cache = self._make_kv_cache()
+        query = torch.randn(2, _Q_HEADS, _HEAD_DIM, dtype=torch.bfloat16)
+        output = torch.empty_like(query)
+        metadata = self._make_metadata(AscendAttentionState.DecodeOnly)
+        metadata.model_runner_type = None
+        impl.vllm_config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(kv_connector="SomeOtherConnector", is_kv_producer=False),
+            parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+            cache_config=SimpleNamespace(cache_dtype="int8"),
+        )
+
+        with pytest.raises(NotImplementedError, match="MooncakeConnectorV1"):
+            impl.forward(self.layer, query, None, None, kv_cache, metadata, output)
 
     def test_quantization_matches_dynamic_quant_operator_semantics(self):
         impl = self._make_impl()

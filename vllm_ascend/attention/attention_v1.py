@@ -2574,6 +2574,21 @@ class AscendC8PerTokenHeadAttentionBackendImpl(AscendC8AttentionBackendImpl):
             return output.fill_(0)
         self._bind_pth_caches(kv_cache)
 
+        from vllm_ascend.utils import uses_mooncake_connector
+
+        if self.vllm_config.kv_transfer_config is not None and not uses_mooncake_connector(
+            self.vllm_config.kv_transfer_config
+        ):
+            # Other connectors move only the K/V pair and would silently drop
+            # the fp32 per-(token, head) scale caches: a D instance receiving
+            # INT8 pages without scales dequantizes into garbage.
+            raise NotImplementedError(
+                "C8 per-token-head v1 PD disaggregation (kv_transfer) is only "
+                "supported with MooncakeConnectorV1, whose block-level transfer "
+                "registers and moves every per-layer cache tensor (INT8 K/V plus "
+                "both fp32 scale caches) as raw blocks."
+            )
+
         # This step's unquantized K/V. They are usable as attention keys only
         # when they cover the WHOLE context of every prefill request in this
         # step (seq_len == this step's query rows): a fresh prefill with no
