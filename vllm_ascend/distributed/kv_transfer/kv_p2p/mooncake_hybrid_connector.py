@@ -893,10 +893,19 @@ class KVCacheRecvingThread(threading.Thread):
             # all MTP layer use the same kv cache layer, so only need to transfer once
             if prefill_pp_rank == self._prefill_pp_size - 1:
                 end_layer_index = end_layer_index + 1
-        num_cache_per_layer = len(list(self.kv_caches.values())[0])  # Number of KV caches per layer
-        local_kv_caches_base_addrs = local_kv_caches_base_addrs_all[
-            first_layer_index * num_cache_per_layer : end_layer_index * num_cache_per_layer
-        ]
+        # Slice the flat per-component address list by LAYER BOUNDARIES. Layer
+        # component counts are heterogeneous across cache types (mamba
+        # conv/ssm = 2, C8-PTH attention k/v/k_scale/v_scale = 4), so a uniform
+        # per-layer count would misalign every layer after the first type
+        # change — the MTP range then transfers from wrong addresses and the
+        # D-side draft verification collapses (acceptance → ~0).
+        layer_component_counts = self.layer_component_counts
+        addr_starts = [0]
+        for count in layer_component_counts:
+            addr_starts.append(addr_starts[-1] + count)
+        first_addr = addr_starts[first_layer_index]
+        end_addr = addr_starts[end_layer_index]
+        local_kv_caches_base_addrs = local_kv_caches_base_addrs_all[first_addr:end_addr]
         logger.debug("transfer kv cache first_layer_index:%s , end_layer_index:%s", first_layer_index, end_layer_index)
         num_blocks = len(local_block_ids)
         session_id = f"{remote_host}:{remote_transfer_port}"
@@ -1806,14 +1815,26 @@ class MooncakeConnectorWorker:
                     ptrs.append(single_kv_cache.data_ptr())
                     lengths.append(single_kv_cache.element_size() * math.prod(single_kv_cache.shape))
         elif self.use_mamba:
+            self.layer_component_counts: list[int] = []
             for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
                 for layer_name in get_kv_cache_tensor_layers(kv_cache_tensor):
                     kv_cache_tuple = kv_caches[layer_name]
                     if isinstance(kv_cache_tuple, (list, tuple)) is False:
                         kv_cache_tuple = [kv_cache_tuple]
+                    # Per-layer component census: count the components that
+                    # actually append to the flat address list (dedup-aware).
+                    # Tuple lengths differ across cache types (mamba conv/ssm
+                    # = 2, C8-PTH attention k/v/k_scale/v_scale = 4), so the
+                    # MTP layer-range transfer must slice the flat list by
+                    # LAYER BOUNDARIES from this census — a uniform per-layer
+                    # count would misalign every layer after the first type
+                    # change and transfer from wrong addresses (MTP
+                    # acceptance collapses to ~0).
+                    appended_components = 0
                     for single_kv_cache in kv_cache_tuple:
                         if single_kv_cache.data_ptr() in self.kv_caches_base_addr:
                             continue
+                        appended_components += 1
                         tensor_num_blocks = single_kv_cache.shape[0]
                         block_size_scale = tensor_num_blocks // self.num_blocks
                         block_shape = single_kv_cache.shape[1:]
@@ -1821,6 +1842,7 @@ class MooncakeConnectorWorker:
                             single_kv_cache.element_size() * math.prod(block_shape) * block_size_scale
                         )
                         self.kv_caches_base_addr.append(single_kv_cache.data_ptr())
+                    self.layer_component_counts.append(appended_components)
             self.block_stride_per_addr.extend(self.block_len_per_addr)
         elif self.use_compress:
             layer_group_idx = dict[str, int]()
