@@ -822,6 +822,55 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
         assert isinstance(self.target_input_buffers, AscendInputBuffers)
         return self.target_input_buffers.seq_lens_cpu[:num_reqs_padded]
 
+    def _debug_draft_probe(self, tag: str, logits, sampled_ids, hidden):
+        """PD+MTP acceptance debug: NaN census of the draft chain (report
+        14.7-2: the MTP layer K/V input went all-NaN from the second verify
+        round; the chain upstream is draft logits -> sampled ids -> embed).
+        DEBUG-gated, first 12 invocations only."""
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        probe_step = getattr(self, "_draft_probe_step", 0)
+        self._draft_probe_step = probe_step + 1
+        if probe_step >= 12:
+            return
+
+        def _nan_count(t):
+            if t is None or not torch.is_tensor(t):
+                return -1
+            return int(torch.isnan(t.float()).sum().item())
+
+        def _tmax(t):
+            if t is None or not torch.is_tensor(t):
+                return float("nan")
+            f = t.detach().float()
+            return float(f.abs().max().item()) if f.numel() else float("nan")
+
+        logger.info(
+            "C8PTH draft probe %s step=%d logits_nan=%d logits_absmax=%.4f "
+            "sampled_nan=%d sampled_ids[:8]=%s hidden_nan=%d hidden_absmax=%.4f",
+            tag,
+            probe_step,
+            _nan_count(logits),
+            _tmax(logits),
+            _nan_count(sampled_ids),
+            sampled_ids.flatten()[:8].tolist() if torch.is_tensor(sampled_ids) else sampled_ids,
+            _nan_count(hidden),
+            _tmax(hidden),
+        )
+
+    def sample_draft(self, *args, **kwargs):
+        """Probe-wrapped override: census the draft logits and the sampled
+        token ids at each draft step (PD+MTP acceptance debug)."""
+        sampled = super().sample_draft(*args, **kwargs)
+        if logger.isEnabledFor(logging.DEBUG):
+            self._debug_draft_probe(
+                "sample_draft",
+                self.draft_logits.values if getattr(self, "draft_logits", None) else None,
+                sampled,
+                args[0] if args else kwargs.get("hidden_states"),
+            )
+        return sampled
+
 
 # TODO Remove this patch when cann fix the gather bug.
 # NOTE(Ronald1995): torch.gather will pollute the cache such as self.input_buffers.positions
