@@ -272,7 +272,20 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         # Align the mamba checkpoint block to the attention block (page bytes
         # are per-state-slot and unaffected). This must run BEFORE the page
         # padding below so the equal-page precondition holds on the final specs.
-        if any(is_c8_pth_kv_quant(vllm_config) and type(spec) is FullAttentionSpec for spec in kv_cache_spec.values()):
+        # Only align in "align" (prefix-caching) mode. In "none" mode upstream
+        # MambaManager assumes block_size == max_model_len: the block table
+        # holds exactly one prompt/state block at column 0, and the Mooncake
+        # connector's transfer_block_idx (len - num_spec - 1) resolves to it.
+        # Shrinking the mamba block below max_model_len makes
+        # get_num_skipped_tokens() (= num_computed - 1) skip past column 0 and
+        # null the state block -> the decode side reads a zero/NaN ssm_state
+        # and MTP acceptance collapses to 0 under PD (report-14.7-2). The
+        # shared-backing interleave this alignment guarded against is already
+        # solved by giving C8-PTH full-attention layers their own backing (see
+        # _allocate_kv_cache), so "none" mode keeps the native block size.
+        if getattr(vllm_config.cache_config, "mamba_cache_mode", None) == "align" and any(
+            is_c8_pth_kv_quant(vllm_config) and type(spec) is FullAttentionSpec for spec in kv_cache_spec.values()
+        ):
             attention_block_size = next(
                 spec.block_size for spec in kv_cache_spec.values() if type(spec) is FullAttentionSpec
             )
