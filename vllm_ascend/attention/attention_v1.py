@@ -2027,21 +2027,42 @@ class AscendC8PerTokenHeadAttentionBackendImpl(AscendC8AttentionBackendImpl):
     def _scatter_pth_scale_caches(self, k_scale: torch.Tensor, v_scale: torch.Tensor, attn_metadata) -> None:
         """Write this step's scales into the paged fp32 scale caches.
 
-        The scale caches are ``(num_blocks, num_kv_heads, block_size, 1)``
+        The scale caches are ``(num_blocks, num_kv_heads, block_size)``
         head-major views over the raw allocation; a token at slot ``s`` lands
-        at ``[s // block_size, :, s % block_size]`` (3-D head-major fp32 cache). Padded rows are
-        clamped to slot 0 (the null block) exactly like the C8-MXFP scale
-        scatter, keeping shapes static for graph capture.
+        at ``[s // block_size, :, s % block_size]``. Padded rows are clamped
+        to slot 0 (the null block) exactly like the C8-MXFP scale scatter,
+        keeping shapes static for graph capture.
+
+        The write uses one ``npu_scatter_nd_update_`` per scale instead of
+        advanced indexing: the indexing form compiles into ~9 small kernels
+        per scale (Cast/Clip/FloorDiv/BroadcastTo/FloorMod/IndexCheck/IndexPut/
+        Range/Index/GatherV3/Transpose), which profiling showed at 1.18M us
+        (4.7% of decode) across 7752 calls. The scatter form collapses it to
+        a single kernel: indices ``[T*H, 3]`` select full (block, head,
+        offset) positions, updates ``[T*H, 1]``.
         """
         if self.k_scale_cache is None or self.kv_sharing_target_layer_name is not None:
             return
         slots = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens]
         safe_slots = slots.to(torch.long).clamp(min=0)
         block_size = self.k_scale_cache.shape[2]
+        num_heads = self.k_scale_cache.shape[1]
+        num_tokens = safe_slots.shape[0]
         block_ids = torch.div(safe_slots, block_size, rounding_mode="floor")
         offsets = safe_slots % block_size
-        self.k_scale_cache[block_ids, :, offsets] = k_scale
-        self.v_scale_cache[block_ids, :, offsets] = v_scale
+        # Full (block, head, offset) positions for every (token, head) pair:
+        # [T*H, 3]. The head axis is an arange over H broadcast per token.
+        head_ids = torch.arange(num_heads, device=safe_slots.device)
+        indices = torch.stack(
+            [
+                block_ids.repeat_interleave(num_heads),
+                head_ids.repeat(num_tokens),
+                offsets.repeat_interleave(num_heads),
+            ],
+            dim=1,
+        )
+        torch_npu.npu_scatter_nd_update_(self.k_scale_cache, indices, k_scale.reshape(-1, 1))
+        torch_npu.npu_scatter_nd_update_(self.v_scale_cache, indices, v_scale.reshape(-1, 1))
 
     def _reshape_and_cache(
         self,

@@ -325,7 +325,8 @@ class TestAscendC8PerTokenHeadBackendImpl(TestBase):
 
     @patch("vllm_ascend.attention.attention_v1.notify_kv_cache_written")
     @patch("vllm_ascend.attention.attention_v1.DeviceOperator.reshape_and_cache")
-    def test_scale_cache_scatter_writes_slot_rows(self, mock_device_scatter, mock_notify):
+    @patch("vllm_ascend.attention.attention_v1.torch_npu.npu_scatter_nd_update_")
+    def test_scale_cache_scatter_writes_slot_rows(self, mock_scatter_nd, mock_device_scatter, mock_notify):
         tokens = 2
         key = torch.randn(tokens, _HEADS, _HEAD_DIM, dtype=torch.bfloat16)
         value = torch.randn_like(key)
@@ -343,11 +344,24 @@ class TestAscendC8PerTokenHeadBackendImpl(TestBase):
 
             k_scale, v_scale = impl._quantize_kv_per_token_head(key, value, tokens)[2:]
 
-        # Slots 5 -> block 0 offset 5, slot 128+7 -> block 1 offset 7.
-        torch.testing.assert_close(kv_cache[2][0, :, 5, 0], k_scale[0])
-        torch.testing.assert_close(kv_cache[2][1, :, 7, 0], k_scale[1])
-        torch.testing.assert_close(kv_cache[3][0, :, 5, 0], v_scale[0])
-        torch.testing.assert_close(kv_cache[3][1, :, 7, 0], v_scale[1])
+        # The write is one scatterNdUpdate per scale with full (block, head,
+        # offset) positions: [T*H, 3] indices, [T*H, 1] updates.
+        assert mock_scatter_nd.call_count == 2
+        k_call, v_call = mock_scatter_nd.call_args_list
+        assert k_call.args[0] is kv_cache[2]
+        assert v_call.args[0] is kv_cache[3]
+        indices, updates = k_call.args[1], k_call.args[2]
+        assert tuple(indices.shape) == (tokens * _HEADS, 3)
+        assert tuple(updates.shape) == (tokens * _HEADS, 1)
+        # Slots 5 -> (block 0, off 5), slot 128+7 -> (block 1, off 7); head
+        # axis repeated per token.
+        expected = []
+        for slot in (5, _BLOCK + 7):
+            for h in range(_HEADS):
+                expected.append([slot // _BLOCK, h, slot % _BLOCK])
+        torch.testing.assert_close(indices, torch.tensor(expected))
+        torch.testing.assert_close(updates.reshape(tokens, _HEADS), k_scale.to(updates.dtype))
+        torch.testing.assert_close(v_call.args[2].reshape(tokens, _HEADS), v_scale.to(torch.float32))
 
 
 class TestAscendC8PerTokenHeadHardwareGate(TestBase):
