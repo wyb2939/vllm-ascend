@@ -24,7 +24,6 @@ import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
-from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (  # type: ignore
@@ -2130,38 +2129,6 @@ class AscendC8PerTokenHeadAttentionBackendImpl(AscendC8AttentionBackendImpl):
         """
         key, value, block_size = self._pth_kv_cache_view()
         antiquant_args = self._pth_antiquant_args()
-        # C8-PTH PD probe: dump the MTP layer's read-side geometry and the
-        # content of the block the draft attention will read, so the D-side
-        # read path can be compared against the transferred-write checksums
-        # (report-14.7). Enabled only with VLLM_C8_PTH_MTP_PROBE=1.
-        if getattr(self, "_layer_name", "").find("mtp") >= 0:
-            probe_step = getattr(self, "_mtp_probe_step", 0)
-            self._mtp_probe_step = probe_step + 1
-            if probe_step < 8:
-                bt = block_table if block_table is not None else attn_metadata.block_tables
-                logger.info(
-                    "C8PTH MTP read probe step=%d layer=%s q_len=%d batch=%d seq_lens=%s "
-                    "block_table[:2]=%s num_kv_heads=%d head_size=%d",
-                    probe_step,
-                    self._layer_name,
-                    query_len,
-                    batch_size,
-                    seq_lens,
-                    bt[:2].tolist() if bt is not None else None,
-                    self.num_kv_heads,
-                    self.head_size,
-                )
-                probe_blk = int(bt[0][-1]) if bt is not None and bt.numel() else 0
-                probe_off = int(seq_lens[0]) % block_size
-                probe_comp = self.k_scale_cache.view(-1)
-                logger.info(
-                    "C8PTH MTP read probe last-block=%d last-offset=%d "
-                    "k_scale_cache.tail-sum=%.6f v_scale_cache.tail-sum=%.6f",
-                    probe_blk,
-                    probe_off,
-                    float(probe_comp.sum().detach().float().cpu()),
-                    float(self.v_scale_cache.float().sum().detach().float().cpu()),
-                )
         block_table = attn_metadata.block_tables if block_table is None else block_table
         seq_lens = attn_metadata.seq_lens_list if seq_lens is None else seq_lens
         if query_rows is None:

@@ -1038,24 +1038,6 @@ class KVCacheRecvingThread(threading.Thread):
                         src_list.append(src)
                         dst_list.append(dst)
                         length_list.append(length)
-                    if layer_idx >= self.num_layers and logger.isEnabledFor(logging.DEBUG):
-                        # MTP-layer transfer geometry probe: the draft layer's
-                        # KV is the acceptance-critical content. Dump the
-                        # per-component spans so a P/D metadata mismatch
-                        # (block_len/stride/geometry) is visible in the logs.
-                        logger.debug(
-                            "Mooncake MTP layer transfer geometry: layer_idx=%d local_block_ids=%s "
-                            "cache_idx_count=%d block_lens=%s block_strides=%s remote_block_strides=%s "
-                            "src_bases=%s dst_bases=%s",
-                            layer_idx,
-                            grouped_local_block_ids,
-                            len(local_kv_caches_base_addrs[layer_idx]),
-                            self.block_len_per_addr[layer_idx],
-                            self.block_stride_per_addr[layer_idx],
-                            remote_block_stride_per_addr[remote_layer_idx],
-                            local_kv_caches_base_addrs[layer_idx],
-                            remote_kv_caches_base_addrs[remote_layer_idx],
-                        )
                     logger.debug(
                         "Mooncake kv transfer meta: request_id=%s group_idx=%s layer_idx=%s local_block_ids=%s "
                         "remote_block_ids=%s tp_num_need_pulls=%s remote_tp_offset=%s session_id=%s",
