@@ -363,6 +363,41 @@ class TestAscendC8PerTokenHeadBackendImpl(TestBase):
         torch.testing.assert_close(updates.reshape(tokens, _HEADS), k_scale.to(updates.dtype))
         torch.testing.assert_close(v_call.args[2].reshape(tokens, _HEADS), v_scale.to(torch.float32))
 
+    @patch("vllm_ascend.attention.attention_v1.notify_kv_cache_written")
+    @patch("vllm_ascend.attention.attention_v1.DeviceOperator.reshape_and_cache")
+    @patch("vllm_ascend.attention.attention_v1.torch_npu.npu_scatter_nd_update_")
+    def test_scale_scatter_indices_cached_per_step(self, mock_scatter_nd, mock_device_scatter, mock_notify):
+        """The scatter indices depend only on the step's slot mapping and cache
+        geometry — identical for every attention layer in the step. The second
+        forward with the SAME metadata must reuse the cached indices (the
+        index-build chain is per-step, not per-layer)."""
+        tokens = 2
+        key = torch.randn(tokens, _HEADS, _HEAD_DIM, dtype=torch.bfloat16)
+        value = torch.randn_like(key)
+        query = torch.randn(tokens, _Q_HEADS, _HEAD_DIM, dtype=torch.bfloat16)
+        output = torch.empty_like(query)
+        quant_patcher = self._mock_dynamic_quant(tokens, _HEADS, _HEAD_DIM)
+        with quant_patcher:
+            impl = self._make_impl()
+            kv_cache = self._make_kv_cache(num_blocks=4)
+            metadata = self._make_metadata(AscendAttentionState.DecodeOnly)
+            metadata.slot_mapping = torch.tensor([5, _BLOCK + 7])
+
+            impl.forward(self.layer, query, key, value, kv_cache, metadata, output)
+            first_indices = metadata.c8_pth_scale_scatter_indices
+            calls_after_first = mock_scatter_nd.call_count
+
+            # Second layer, same step metadata: indices must be the cached
+            # object (no rebuild).
+            impl2 = self._make_impl()
+            impl2.k_scale_cache = kv_cache[2]
+            impl2.v_scale_cache = kv_cache[3]
+            impl2._layer_name = "model.layers.1.self_attn.attn"
+            k2, v2 = impl2._quantize_kv_per_token_head(key, value, tokens)[2:]
+            impl2._scatter_pth_scale_caches(k2, v2, metadata)
+            assert mock_scatter_nd.call_count == calls_after_first + 2
+            assert metadata.c8_pth_scale_scatter_indices is first_indices
+
 
 class TestAscendC8PerTokenHeadHardwareGate(TestBase):
     """The mode-5 path is A2/A3 only; A5 must refuse it at construction and

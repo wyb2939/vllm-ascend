@@ -2043,24 +2043,35 @@ class AscendC8PerTokenHeadAttentionBackendImpl(AscendC8AttentionBackendImpl):
         """
         if self.k_scale_cache is None or self.kv_sharing_target_layer_name is not None:
             return
-        slots = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens]
-        safe_slots = slots.to(torch.long).clamp(min=0)
-        block_size = self.k_scale_cache.shape[2]
-        num_heads = self.k_scale_cache.shape[1]
-        num_tokens = safe_slots.shape[0]
-        block_ids = torch.div(safe_slots, block_size, rounding_mode="floor")
-        offsets = safe_slots % block_size
-        # Full (block, head, offset) positions for every (token, head) pair:
-        # [T*H, 3]. The head axis is an arange over H broadcast per token.
-        head_ids = torch.arange(num_heads, device=safe_slots.device)
-        indices = torch.stack(
-            [
-                block_ids.repeat_interleave(num_heads),
-                head_ids.repeat(num_tokens),
-                offsets.repeat_interleave(num_heads),
-            ],
-            dim=1,
-        )
+        # The scatter indices depend only on the step's slot mapping and the
+        # cache geometry — identical for every attention layer in the step
+        # — so build them once per step and cache them on the shared
+        # metadata (report-PD-1128-3: without the cache the index-build
+        # chain Cast/Clip/FloorDiv/BroadcastTo/FloorMod/Range/
+        # BroadcastTo/RepeatInterleave/Tile/Pack re-ran per layer, 16x
+        # per step).
+        indices = getattr(attn_metadata, "c8_pth_scale_scatter_indices", None)
+        if indices is None:
+            slots = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens]
+            safe_slots = slots.to(torch.long).clamp(min=0)
+            block_size = self.k_scale_cache.shape[2]
+            num_heads = self.k_scale_cache.shape[1]
+            num_tokens = safe_slots.shape[0]
+            block_ids = torch.div(safe_slots, block_size, rounding_mode="floor")
+            offsets = safe_slots % block_size
+            # Full (block, head, offset) positions for every (token,
+            # head) pair: [T*H, 3]. The head axis is an arange over H
+            # repeated per token.
+            head_ids = torch.arange(num_heads, device=safe_slots.device)
+            indices = torch.stack(
+                [
+                    block_ids.repeat_interleave(num_heads),
+                    head_ids.repeat(num_tokens),
+                    offsets.repeat_interleave(num_heads),
+                ],
+                dim=1,
+            )
+            attn_metadata.c8_pth_scale_scatter_indices = indices
         torch_npu.npu_scatter_nd_update_(self.k_scale_cache, indices, k_scale.reshape(-1, 1))
         torch_npu.npu_scatter_nd_update_(self.v_scale_cache, indices, v_scale.reshape(-1, 1))
 
